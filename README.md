@@ -1,4 +1,4 @@
-# VantaOps
+# AI Compliance Ops Bot (VantaOps)
 
 Your team's compliance co-pilot. VantaOps watches Vanta for failing compliance checks, pings you on Slack, and helps fix AWS issues — all with your approval, never on its own.
 
