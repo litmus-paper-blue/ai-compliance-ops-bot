@@ -1,0 +1,43 @@
+# ==========================================================================
+# ComplianceOps — Slack Bot Container
+#
+# Python-based Slack Bolt app running in Socket Mode.
+# Uses PostgreSQL for database (connection via DATABASE_URL env var).
+# Also has AWS CLI for running remediation scripts.
+# ==========================================================================
+
+FROM python:3.12-slim
+
+# System dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    unzip \
+    jq \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# AWS CLI v2 (needed for remediation scripts)
+RUN curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" \
+    -o /tmp/awscliv2.zip \
+    && unzip -q /tmp/awscliv2.zip -d /tmp \
+    && /tmp/aws/install \
+    && rm -rf /tmp/aws /tmp/awscliv2.zip
+
+# Python dependencies
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt \
+    && rm /tmp/requirements.txt
+
+# Create app directories
+RUN mkdir -p /app/config
+
+WORKDIR /app
+
+# Copy source code
+COPY src/ /app/src/
+COPY config/ /app/config/
+
+# Set Python path so imports work
+ENV PYTHONPATH=/app:/app/src
+
+CMD ["python", "-m", "src.bot.app"]

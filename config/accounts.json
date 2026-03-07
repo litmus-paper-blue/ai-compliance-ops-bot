@@ -1,0 +1,22 @@
+{
+  "accounts": {
+    "dev": {
+      "id": "111111111111",
+      "role_arn": "arn:aws:iam::111111111111:role/vantaops-remediation-role",
+      "region": "us-east-1",
+      "label": "Development"
+    },
+    "staging": {
+      "id": "222222222222",
+      "role_arn": "arn:aws:iam::222222222222:role/vantaops-remediation-role",
+      "region": "us-east-1",
+      "label": "Staging"
+    },
+    "prod": {
+      "id": "333333333333",
+      "role_arn": "arn:aws:iam::333333333333:role/vantaops-remediation-role",
+      "region": "us-east-1",
+      "label": "Production"
+    }
+  }
+}

@@ -1,0 +1,89 @@
+version: "3.8"
+
+# ==========================================================================
+# ComplianceOps — Docker Compose
+#
+# Services:
+#   postgres   — PostgreSQL database (shared state)
+#   openclaw   — OpenClaw gateway (agent + Claude LLM + skills) [optional]
+#   slack-bot  — Slack Bolt app (Socket Mode, interactive buttons)
+# ==========================================================================
+
+services:
+
+  # ── PostgreSQL ───────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: complianceops-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: vantaops
+      POSTGRES_PASSWORD: vantaops
+      POSTGRES_DB: vantaops
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    networks:
+      - complianceops
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vantaops"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── OpenClaw Agent (optional) ────────────────────────────────────────────
+  openclaw:
+    build:
+      context: .
+      dockerfile: Dockerfile.openclaw
+    container_name: complianceops-openclaw
+    restart: unless-stopped
+    volumes:
+      - openclaw-data:/home/node/.openclaw
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql://vantaops:vantaops@postgres:5432/vantaops
+      - PYTHONPATH=/app:/app/src
+    ports:
+      - "${OPENCLAW_PORT:-3010}:3010"
+    networks:
+      - complianceops
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3010/health"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ── Slack Bot ────────────────────────────────────────────────────────────
+  slack-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.slack
+    container_name: complianceops-slack
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql://vantaops:vantaops@postgres:5432/vantaops
+      - PYTHONPATH=/app:/app/src
+    networks:
+      - complianceops
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pg-data:
+    driver: local
+  openclaw-data:
+    driver: local
+
+networks:
+  complianceops:
+    driver: bridge

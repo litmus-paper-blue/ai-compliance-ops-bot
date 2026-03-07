@@ -1,0 +1,57 @@
+# ==========================================================================
+# ComplianceOps — OpenClaw Agent Container
+#
+# Includes: Node.js, Python 3, AWS CLI v2, OpenClaw, curl, jq
+# Runs as non-root user "node" (OpenClaw convention)
+# ==========================================================================
+
+FROM node:20-slim AS base
+
+# System dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    unzip \
+    jq \
+    git \
+    python3 \
+    python3-pip \
+    python3-venv \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# AWS CLI v2
+RUN curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" \
+    -o /tmp/awscliv2.zip \
+    && unzip -q /tmp/awscliv2.zip -d /tmp \
+    && /tmp/aws/install \
+    && rm -rf /tmp/aws /tmp/awscliv2.zip
+
+# Python dependencies for ComplianceOps scripts
+COPY requirements.txt /tmp/requirements.txt
+RUN pip3 install --break-system-packages --no-cache-dir -r /tmp/requirements.txt \
+    && rm /tmp/requirements.txt
+
+# Install OpenClaw globally
+RUN npm install -g openclaw
+
+# Create app directories
+RUN mkdir -p /app/src /app/config \
+    && chown -R node:node /app
+
+# Switch to non-root user
+USER node
+WORKDIR /home/node
+
+# OpenClaw workspace setup
+RUN mkdir -p /home/node/.openclaw/workspace/skills
+
+# Copy source code and configuration
+COPY --chown=node:node src/ /app/src/
+COPY --chown=node:node config/ /app/config/
+COPY --chown=node:node config/openclaw.json /home/node/.openclaw/openclaw.json
+
+# Set Python path
+ENV PYTHONPATH=/app:/app/src
+
+# Entry point
+CMD ["openclaw", "gateway"]

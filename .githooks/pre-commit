@@ -1,0 +1,31 @@
+#!/bin/bash
+# Pre-commit hook to prevent accidental secret commits
+# Install with: git config core.hooksPath .githooks
+
+set -e
+
+# Patterns to check for
+PATTERNS=(
+    "sk-ant-[A-Za-z0-9]"           # Anthropic keys
+    "xoxb-[A-Za-z0-9]"            # Slack bot tokens
+    "xapp-[A-Za-z0-9]"            # Slack app tokens
+    "AKIA[0-9A-Z]{16}"            # AWS access keys
+    "password['\"]?\s*[:=]"        # Password assignments
+)
+
+FOUND=0
+
+for pattern in "${PATTERNS[@]}"; do
+    if git diff --cached | grep -iE "$pattern" > /dev/null; then
+        echo "⚠️  SECURITY: Potential secret detected matching pattern: $pattern"
+        echo "   Review: git diff --cached"
+        FOUND=1
+    fi
+done
+
+if [ $FOUND -eq 1 ]; then
+    echo "❌ Commit blocked. If false positive, use: git commit --no-verify"
+    exit 1
+fi
+
+exit 0

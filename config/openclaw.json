@@ -1,0 +1,45 @@
+{
+  "llm": {
+    "provider": "anthropic",
+    "model": "claude-sonnet-4-5-20250929"
+  },
+  "channels": {
+    "slack": {
+      "enabled": true,
+      "dmPolicy": "pairing",
+      "allowFrom": []
+    }
+  },
+  "skills": {
+    "entries": {
+      "vanta-poller": {
+        "enabled": true
+      },
+      "aws-remediate": {
+        "enabled": true
+      }
+    }
+  },
+  "heartbeat": {
+    "enabled": true,
+    "interval": "24h",
+    "tasks": [
+      "Run the vanta-poller skill to check for compliance tasks due within 5 days. Report the summary here and send Slack notifications for any new or overdue tasks."
+    ]
+  },
+  "memory": {
+    "enabled": true
+  },
+  "tools": {
+    "exec": {
+      "enabled": true,
+      "approval": "auto"
+    },
+    "file": {
+      "enabled": true
+    },
+    "browser": {
+      "enabled": false
+    }
+  }
+}
