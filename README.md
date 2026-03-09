@@ -6,8 +6,8 @@ Talk to it like a person. It remembers what worked before and gets smarter over 
 
 ## What it does
 
-1. **Watches Vanta** — polls daily for compliance tasks due in the next 5 days
-2. **Pings you on Slack** — sends a message with details and action buttons
+1. **Watches Vanta** — polls for failing compliance tests and vulnerabilities, stores everything in the database
+2. **Pings you on Slack** — sends individual alerts for tasks due in the next 7 days, plus a summary of everything else
 3. **Plans the fix** — generates the exact AWS commands needed (you see them before anything runs)
 4. **Waits for your OK** — nothing executes without you clicking Approve
 5. **Remembers what happened** — stores lessons from past fixes so it doesn't repeat mistakes
@@ -18,10 +18,13 @@ VantaOps understands natural language. No need to memorize commands.
 
 **In a channel:**
 > @VantaOps what's overdue?
+> @VantaOps show me all tests due in 10 days
+> @VantaOps any vulnerabilities due by March 19th?
 > @VantaOps how do I fix S3 encryption on the logs bucket?
 
 **In a DM:**
 > What tasks are due this week?
+> Show me everything due in 14 days
 > Walk me through fixing a security group issue
 
 **Teach it something:**
@@ -36,10 +39,13 @@ These still work for when you want something fast:
 
 | Command | What it does |
 |---------|-------------|
-| `/vantaops status` | How many tasks are pending, fixed, or snoozed |
-| `/vantaops poll` | Check Vanta right now instead of waiting for the daily poll |
+| `/vantaops status` | Summary with counts: due in 7 days, overdue, pending, remediated |
+| `/vantaops poll` | Fetch from Vanta now — stores all tasks, alerts only what's due in 7 days |
+| `/vantaops due <days>` | List tasks due in N days (e.g. `/vantaops due 10`, `/vantaops due 30`) |
 | `/vantaops audit` | See the last 10 things VantaOps did |
 | `/vantaops task <id>` | Full details on a specific task |
+
+Any other text after `/vantaops` is treated as a natural language question — e.g. `/vantaops show me everything due in 12 days` works too.
 
 ## When a notification arrives
 
@@ -61,7 +67,7 @@ You (Slack) ←→ Slack Bot (Python, Socket Mode)
 ```
 
 - **Slack bot** — Python app using Slack Bolt in Socket Mode (no public URL needed)
-- **LLM** — Claude Haiku is primary, Gemini Flash is backup. If one runs out of quota, it switches automatically
+- **LLM** — Azure OpenAI, Anthropic, and Google supported with automatic fallback. If one runs out of quota, it switches automatically
 - **PostgreSQL** — stores tasks, audit logs, and the knowledge base (lessons learned)
 - **Vanta API** — OAuth2 polling for failing tests and approaching vulnerabilities
 - **AWS** — remediations run via AssumeRole into target accounts. The bot's own credentials can only assume roles, nothing else.
@@ -73,7 +79,7 @@ You (Slack) ←→ Slack Bot (Python, Socket Mode)
 
 - Docker & Docker Compose
 - A Slack workspace where you're an admin
-- At least one LLM API key (Anthropic or Google)
+- At least one LLM API key (Azure OpenAI, Anthropic, or Google)
 - Vanta API credentials (optional — needed for polling, not for testing the bot)
 - AWS credentials (optional — needed for remediation, not for testing the bot)
 
@@ -107,6 +113,9 @@ SLACK_CHANNEL_ID=C...
 
 # At least one LLM provider
 ANTHROPIC_API_KEY=sk-ant-...
+AZURE_OPENAI_API_KEY=...
+AZURE_OPENAI_ENDPOINT=https://...openai.azure.com
+AZURE_OPENAI_DEPLOYMENT=gpt-4.1-mini
 GOOGLE_API_KEY=...
 
 # Database
@@ -165,6 +174,9 @@ You need Vanta Admin to create API credentials:
 2. Create a new app (type: "Manage Vanta")
 3. Copy the Client ID and generate a Client Secret
 4. Add both to your `.env`
+5. Restart the bot and run `/vantaops poll` to sync
+
+The poller fetches all failing tests and vulnerabilities from Vanta, stores them in the database for historical queries, and sends Slack alerts only for tasks due in the next 7 days (configurable via `VANTAOPS_ALERT_WINDOW_DAYS`).
 
 If you're a Vanta Editor, ask an admin to create the credentials for you.
 

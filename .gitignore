@@ -27,6 +27,13 @@ pg_data/
 *~
 .DS_Store
 
+# Terraform
+terraform.tfvars
+*.tfstate
+*.tfstate.backup
+.terraform/
+.terraform.lock.hcl
+
 # Docker
 .docker/
 

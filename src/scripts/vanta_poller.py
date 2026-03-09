@@ -17,13 +17,12 @@ from typing import Optional
 import requests
 
 from db import get_db, dict_cursor, init_db
+from vanta_client import VantaClient
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-VANTA_API_BASE = "https://api.vanta.com"
-VANTA_AUTH_URL = f"{VANTA_API_BASE}/oauth/token"
 VANTA_CLIENT_ID = os.environ.get("VANTA_CLIENT_ID", "")
 VANTA_CLIENT_SECRET = os.environ.get("VANTA_CLIENT_SECRET", "")
 
@@ -37,114 +36,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
 )
 log = logging.getLogger("vanta-poller")
-
-
-
-
-# ---------------------------------------------------------------------------
-# Vanta API Client
-# ---------------------------------------------------------------------------
-
-class VantaClient:
-    """Minimal Vanta REST API client using OAuth2 client credentials."""
-
-    def __init__(self, client_id: str, client_secret: str):
-        self.client_id = client_id
-        self.client_secret = client_secret
-        self._token: Optional[str] = None
-        self._token_expiry: float = 0
-
-    def _authenticate(self) -> str:
-        """Obtain or refresh an OAuth2 access token."""
-        if self._token and time.time() < self._token_expiry:
-            return self._token
-
-        log.info("Authenticating with Vanta API...")
-        resp = requests.post(
-            VANTA_AUTH_URL,
-            json={
-                "grant_type": "client_credentials",
-                "client_id": self.client_id,
-                "client_secret": self.client_secret,
-                "scope": "vanta-api.all:read",
-            },
-            headers={"Content-Type": "application/json"},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        self._token = data["access_token"]
-        # Expire 5 min early to be safe
-        self._token_expiry = time.time() + data.get("expires_in", 3600) - 300
-        log.info("Authenticated successfully.")
-        return self._token
-
-    def _headers(self) -> dict:
-        return {
-            "Authorization": f"Bearer {self._authenticate()}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
-
-    def _get_paginated(self, endpoint: str, params: dict = None) -> list:
-        """Fetch all pages from a paginated Vanta endpoint."""
-        results = []
-        params = params or {}
-        params.setdefault("pageSize", 100)
-        cursor = None
-
-        while True:
-            if cursor:
-                params["pageCursor"] = cursor
-            resp = requests.get(
-                f"{VANTA_API_BASE}{endpoint}",
-                headers=self._headers(),
-                params=params,
-                timeout=30,
-            )
-            resp.raise_for_status()
-            body = resp.json()
-
-            data = body.get("results", {}).get("data", [])
-            results.extend(data)
-
-            page_info = body.get("results", {}).get("pageInfo", {})
-            if page_info.get("hasNextPage") and page_info.get("endCursor"):
-                cursor = page_info["endCursor"]
-            else:
-                break
-
-        return results
-
-    def get_failing_tests(self) -> list:
-        """Fetch tests that are currently failing."""
-        log.info("Fetching failing tests from Vanta...")
-        # The Vanta API allows filtering tests by status
-        tests = self._get_paginated(
-            "/v1/tests",
-            params={"filter[status]": "FAILING"},
-        )
-        log.info(f"Found {len(tests)} failing tests.")
-        return tests
-
-    def get_vulnerabilities(self, sla_days: int = 5) -> list:
-        """Fetch vulnerabilities with SLA approaching within N days."""
-        log.info(f"Fetching vulnerabilities with SLA within {sla_days} days...")
-        cutoff = (datetime.now(timezone.utc) + timedelta(days=sla_days)).isoformat()
-        vulns = self._get_paginated(
-            "/v1/vulnerabilities",
-            params={"filter[slaDeadlineBefore]": cutoff},
-        )
-        log.info(f"Found {len(vulns)} vulnerabilities approaching SLA.")
-        return vulns
-
-    def get_resources(self, resource_type: str = None) -> list:
-        """Fetch monitored resources, optionally filtered by type."""
-        log.info(f"Fetching resources (type={resource_type})...")
-        params = {}
-        if resource_type:
-            params["filter[resourceType]"] = resource_type
-        return self._get_paginated("/v1/resources", params=params)
 
 
 # ---------------------------------------------------------------------------
@@ -187,22 +78,37 @@ def classify_remediation_type(title: str, description: str = "") -> str:
 def extract_aws_context(finding: dict) -> dict:
     """Extract AWS account, region, and resource info from a Vanta finding."""
     # Vanta structures vary — this handles common patterns
-    resource = finding.get("resource", {})
-    integration = finding.get("integration", {})
+    resource = finding.get("resource", {}) or {}
+    integration = finding.get("integration", {}) or {}
+
+    # Vulnerabilities use flat fields like targetId, integrationId
+    resource_id = (
+        resource.get("id", "")
+        or resource.get("externalId", "")
+        or finding.get("targetId", "")
+        or finding.get("packageIdentifier", "")
+    )
+    resource_type = (
+        resource.get("resourceType", "")
+        or finding.get("vulnerabilityType", "")
+    )
+    account_id = (
+        integration.get("accountId", "")
+        or resource.get("accountId", "")
+        or finding.get("integrationId", "")
+        or _extract_account_from_arn(resource.get("arn", ""))
+    )
+    region = (
+        resource.get("region", "")
+        or _extract_region_from_arn(resource.get("arn", ""))
+        or "us-east-1"
+    )
 
     return {
-        "resource_id": resource.get("id", resource.get("externalId", "")),
-        "resource_type": resource.get("resourceType", ""),
-        "account_id": (
-            integration.get("accountId", "")
-            or resource.get("accountId", "")
-            or _extract_account_from_arn(resource.get("arn", ""))
-        ),
-        "region": (
-            resource.get("region", "")
-            or _extract_region_from_arn(resource.get("arn", ""))
-            or "us-east-1"
-        ),
+        "resource_id": resource_id,
+        "resource_type": resource_type,
+        "account_id": account_id,
+        "region": region,
     }
 
 
@@ -339,36 +245,45 @@ def send_slack_notification(task: dict) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 def format_dashboard_summary(tasks: list) -> str:
-    """Format a summary string for the OpenClaw dashboard."""
+    """Format a summary showing only tasks due in the next 7 days.
+    Overdue tasks are stored in DB but not shown unless explicitly requested."""
+    ALERT_WINDOW_DAYS = int(os.environ.get("VANTAOPS_ALERT_WINDOW_DAYS", "7"))
     now = datetime.now(timezone.utc)
-    overdue = []
-    due_soon = []  # within 2 days
-    upcoming = []  # 3-5 days
+    alert_cutoff = now + timedelta(days=ALERT_WINDOW_DAYS)
+
+    overdue_count = 0
+    due_soon = []   # within 2 days
+    upcoming = []   # 3-7 days
 
     for t in tasks:
-        due = datetime.fromisoformat(t["due_date"].replace("Z", "+00:00"))
+        try:
+            due = datetime.fromisoformat(t["due_date"].replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            continue
         days_left = (due - now).days
-        entry = f"  - {t['title']} ({t.get('account_id', '?')}, {t.get('region', '?')}) — due {t['due_date'][:10]}"
 
         if days_left < 0:
-            overdue.append(entry)
-        elif days_left <= 2:
+            overdue_count += 1
+            continue  # don't list overdue individually
+
+        if due > alert_cutoff:
+            continue  # outside the alert window
+
+        entry = f"  - {t['title'][:80]} — due {t['due_date'][:10]} ({days_left}d)"
+
+        if days_left <= 2:
             due_soon.append(entry)
         else:
             upcoming.append(entry)
 
     auto_count = sum(1 for t in tasks if t["remediation_type"] != "manual")
     manual_count = len(tasks) - auto_count
+    active_count = len(due_soon) + len(upcoming)
 
     lines = [
         f"📋 Vanta Compliance Summary — {now.strftime('%B %d, %Y')}",
         "",
     ]
-
-    if overdue:
-        lines.append(f"🔴 Overdue ({len(overdue)}):")
-        lines.extend(overdue)
-        lines.append("")
 
     if due_soon:
         lines.append(f"🟡 Due within 2 days ({len(due_soon)}):")
@@ -376,17 +291,18 @@ def format_dashboard_summary(tasks: list) -> str:
         lines.append("")
 
     if upcoming:
-        lines.append(f"🟢 Due within 5 days ({len(upcoming)}):")
+        lines.append(f"🟢 Due within {ALERT_WINDOW_DAYS} days ({len(upcoming)}):")
         lines.extend(upcoming)
         lines.append("")
 
-    if not tasks:
-        lines.append("✅ No tasks due in the next 5 days. Looking good!")
+    if not due_soon and not upcoming:
+        lines.append(f"✅ No tasks due in the next {ALERT_WINDOW_DAYS} days.")
         lines.append("")
 
+    lines.append(f"Total synced: {len(tasks)} | Due soon: {active_count} | Overdue: {overdue_count}")
     lines.append(f"Auto-remediable: {auto_count} | Manual: {manual_count}")
     lines.append("")
-    lines.append("Reply with a task ID or click 'Remediate' in Slack to fix.")
+    lines.append("Use `/vantaops due <days>` to query a custom range or ask me in natural language.")
 
     return "\n".join(lines)
 
@@ -403,20 +319,39 @@ def poll_and_notify(conn, client: VantaClient) -> str:
     failing_tests = client.get_failing_tests()
     vulnerabilities = client.get_vulnerabilities(sla_days=LOOKAHEAD_DAYS)
 
+    log.info(f"Fetched {len(failing_tests)} failing tests, {len(vulnerabilities)} vulnerabilities from Vanta.")
+
     # 2. Normalize into a common task format
     tasks = []
 
     for test in failing_tests:
         task_id = test.get("id", "")
-        title = test.get("title", test.get("name", "Unnamed test"))
-        description = test.get("description", "")
-        due_date = test.get("remediationSlaDeadline", "")
+        title = test.get("name", test.get("title", "Unnamed test"))
+        description = test.get("description", test.get("failureDescription", ""))
+        # Vanta tests use remediationStatusInfo or don't have explicit SLA dates.
+        # For failing tests, derive a deadline: remediation target or default 14 days from flip.
+        remediation_info = test.get("remediationStatusInfo", {}) or {}
+        due_date = remediation_info.get("remediateByDate", "")
+        if not due_date:
+            # Fallback: use latestFlipDate + LOOKAHEAD_DAYS * 3 as synthetic deadline
+            flip_date = test.get("latestFlipDate", "")
+            if flip_date:
+                try:
+                    flip_dt = datetime.fromisoformat(flip_date.replace("Z", "+00:00"))
+                    synthetic_due = flip_dt + timedelta(days=30)
+                    due_date = synthetic_due.isoformat()
+                except (ValueError, TypeError):
+                    pass
         if not due_date:
             continue
 
-        framework = test.get("framework", {}).get("name", "")
+        framework = test.get("category", test.get("framework", {}).get("name", ""))
         aws_ctx = extract_aws_context(test)
         rtype = classify_remediation_type(title, description)
+
+        # Extract owner info
+        owner_info = test.get("owner", {}) or {}
+        owner = owner_info.get("displayName", owner_info.get("email", ""))
 
         tasks.append({
             "task_id": task_id,
@@ -425,14 +360,16 @@ def poll_and_notify(conn, client: VantaClient) -> str:
             "due_date": due_date,
             "framework": framework,
             "remediation_type": rtype,
+            "severity": test.get("status", ""),
+            "owner": owner,
             **aws_ctx,
         })
 
     for vuln in vulnerabilities:
         task_id = vuln.get("id", "")
-        title = vuln.get("title", vuln.get("name", "Unnamed vulnerability"))
+        title = vuln.get("name", vuln.get("title", "Unnamed vulnerability"))
         description = vuln.get("description", "")
-        due_date = vuln.get("slaDeadline", "")
+        due_date = vuln.get("remediateByDate", vuln.get("slaDeadline", ""))
         if not due_date:
             continue
 
@@ -446,6 +383,8 @@ def poll_and_notify(conn, client: VantaClient) -> str:
             "due_date": due_date,
             "framework": vuln.get("framework", {}).get("name", ""),
             "remediation_type": rtype,
+            "severity": vuln.get("severity", ""),
+            "owner": "",
             **aws_ctx,
         })
 
@@ -468,23 +407,51 @@ def poll_and_notify(conn, client: VantaClient) -> str:
 
     log.info(f"Total tasks found: {len(tasks)}, new to notify: {len(new_tasks)}")
 
-    # 4. Store and notify
+    # 4. Store ALL tasks in DB; only send individual Slack alerts for tasks due within 7 days
+    ALERT_WINDOW_DAYS = int(os.environ.get("VANTAOPS_ALERT_WINDOW_DAYS", "7"))
+    alert_cutoff = datetime.now(timezone.utc) + timedelta(days=ALERT_WINDOW_DAYS)
+    alerted_count = 0
+
+    # Sort by due date (most urgent first)
+    new_tasks.sort(key=lambda t: t.get("due_date", "9999"))
+
     for task in new_tasks:
         now_iso = datetime.now(timezone.utc).isoformat()
 
-        # Send Slack notification
-        slack_ts = send_slack_notification(task)
+        # Only send individual Slack alerts for tasks due between now and the alert window
+        # (skip old/past-due tasks from 2024 etc. — they're stored in DB for historical queries)
+        slack_ts = None
+        now_dt = datetime.now(timezone.utc)
+        try:
+            task_due = datetime.fromisoformat(task["due_date"].replace("Z", "+00:00"))
+            if now_dt <= task_due <= alert_cutoff:
+                slack_ts = send_slack_notification(task)
+                alerted_count += 1
+        except (ValueError, TypeError):
+            pass
 
-        # Upsert into database
+        # Upsert into database (always)
         cur.execute("""
             INSERT INTO vanta_tasks
                 (task_id, title, description, due_date, framework,
                  resource_id, resource_type, account_id, region,
-                 remediation_type, status, notified_at, slack_ts, raw_json)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'notified', %s, %s, %s)
+                 remediation_type, severity, owner, status, notified_at, slack_ts, raw_json)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'notified', %s, %s, %s)
             ON CONFLICT(task_id) DO UPDATE SET
+                title = EXCLUDED.title,
+                description = EXCLUDED.description,
+                due_date = EXCLUDED.due_date,
+                framework = EXCLUDED.framework,
+                resource_id = EXCLUDED.resource_id,
+                resource_type = EXCLUDED.resource_type,
+                account_id = EXCLUDED.account_id,
+                region = EXCLUDED.region,
+                remediation_type = EXCLUDED.remediation_type,
                 notified_at = EXCLUDED.notified_at,
-                slack_ts = EXCLUDED.slack_ts,
+                slack_ts = COALESCE(EXCLUDED.slack_ts, vanta_tasks.slack_ts),
+                severity = COALESCE(EXCLUDED.severity, vanta_tasks.severity),
+                owner = COALESCE(EXCLUDED.owner, vanta_tasks.owner),
+                raw_json = EXCLUDED.raw_json,
                 status = CASE
                     WHEN vanta_tasks.status = 'remediated' THEN 'remediated'
                     ELSE 'notified'
@@ -494,14 +461,17 @@ def poll_and_notify(conn, client: VantaClient) -> str:
             task["due_date"], task["framework"],
             task.get("resource_id"), task.get("resource_type"),
             task.get("account_id"), task.get("region"),
-            task["remediation_type"], now_iso, slack_ts,
+            task["remediation_type"], task.get("severity", ""),
+            task.get("owner", ""), now_iso, slack_ts,
             json.dumps(task),
         ))
 
     conn.commit()
     cur.close()
 
-    # 5. Return summary for OpenClaw dashboard
+    log.info(f"Stored {len(new_tasks)} tasks in DB, sent {alerted_count} Slack alerts (due within {ALERT_WINDOW_DAYS}d)")
+
+    # 5. Return summary
     summary = format_dashboard_summary(tasks if tasks else new_tasks)
     return summary
 

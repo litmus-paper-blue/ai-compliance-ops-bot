@@ -7,16 +7,19 @@ triggers from Slack. Runs as a standalone service alongside OpenClaw.
 
 import os
 import sys
+import re
 import json
 import logging
 import subprocess
 from datetime import datetime, timezone
+from typing import Optional
 
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from db import get_db, dict_cursor, init_db
 from llm import LLMRouter
+from vanta_client import VantaClient
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -44,30 +47,162 @@ log = logging.getLogger("vantaops-slack")
 # ---------------------------------------------------------------------------
 
 app = App(token=SLACK_BOT_TOKEN)
-llm = None  # initialized after db in main()
+llm = None    # initialized after db in main()
+vanta = None  # initialized after db in main()
 
 SYSTEM_PROMPT = """You are VantaOps, an AI-powered Vanta compliance remediation assistant.
 
 Your job is to help users understand and fix AWS compliance findings flagged by Vanta.
-You focus on: CloudWatch alarms, S3 bucket security, security groups, SSM patching, and CloudTrail/Config logging.
+You cover: CloudWatch, S3, security groups, SSM patching, CloudTrail/Config, RDS, DynamoDB, EKS, GuardDuty, Inspector, ACM, VPC flow logs, and more.
+
+When a user asks about a specific task or finding:
+1. Reference the exact task from the database context (title, due date, type, account, region).
+2. Explain *what* the finding means and *why* it matters for compliance.
+3. Explain *how* to fix it step by step. Be specific — mention the exact AWS CLI commands or console steps.
+4. If the task is auto-remediable, tell the user they can click "View Plan & Remediate" on the Slack notification, or use `/vantaops task <id>` to see details.
+5. If the user says "yes", "proceed", "fix it", "remediate" — guide them to the Slack notification button or provide the `/vantaops task <id>` command. Don't lose context.
+
+When a user asks a follow-up or says "yes":
+- Remember what you were just discussing. The conversation history is provided — use it.
+- Don't start fresh or ask "what would you like help with?" — continue the thread.
 
 Rules:
 - Be concise. Use Slack-friendly formatting (*bold*, `code`, bullet points).
-- When discussing remediation, always mention that execution requires explicit approval.
-- Never fabricate task IDs, AWS resource IDs, or compliance details — only reference what's in the database.
+- Never fabricate task IDs, AWS resource IDs, or compliance details — only reference what's in the database context.
 - If you have relevant lessons from past remediations (provided in context), reference them.
 - If you don't know something, say so and suggest checking Vanta or AWS directly.
-- You are NOT allowed to execute AWS commands directly — only the remediation engine does that with user approval.
+- Remediation execution requires explicit approval via the Slack button — you cannot execute AWS commands directly.
+- IAM policy changes are always manual — flag these and explain why.
 """
+
+
+def _extract_lookahead_days(message: str) -> int:
+    """Extract a day-range from the user's message, default 7."""
+    # Match patterns like "10 days", "in 12 days", "due 30 days", "next 14 days"
+    m = re.search(r'(\d+)\s*days?', message.lower())
+    if m:
+        return min(int(m.group(1)), 365)
+    # Match specific dates like "March 14" or "2026-03-19"
+    # Calculate days from now to that date
+    date_patterns = [
+        (r'(\w+)\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s*(\d{4}))?', '%B %d %Y'),
+        (r'(\d{4})-(\d{2})-(\d{2})', None),
+    ]
+    for pattern, fmt in date_patterns:
+        match = re.search(pattern, message)
+        if match:
+            try:
+                if fmt:
+                    month_str, day_str = match.group(1), match.group(2)
+                    year_str = match.group(3) or str(datetime.now(timezone.utc).year)
+                    target = datetime.strptime(f"{month_str} {day_str} {year_str}", fmt)
+                    target = target.replace(tzinfo=timezone.utc)
+                else:
+                    target = datetime(int(match.group(1)), int(match.group(2)), int(match.group(3)), tzinfo=timezone.utc)
+                days = (target - datetime.now(timezone.utc)).days
+                if days > 0:
+                    return min(days, 365)
+            except (ValueError, TypeError):
+                pass
+    return 7
+
+
+def _extract_specific_date_iso(message: str) -> Optional[str]:
+    """Extract a specific date from user text as YYYY-MM-DD, if present."""
+    now_utc = datetime.now(timezone.utc)
+    text = message.strip()
+
+    # ISO format: 2026-03-19
+    iso_match = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", text)
+    if iso_match:
+        try:
+            dt = datetime(
+                int(iso_match.group(1)),
+                int(iso_match.group(2)),
+                int(iso_match.group(3)),
+                tzinfo=timezone.utc,
+            )
+            return dt.strftime("%Y-%m-%d")
+        except ValueError:
+            return None
+
+    # Month name format: March 19 or March 19, 2026
+    month_match = re.search(
+        r"\b([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s*(\d{4}))?\b",
+        text,
+    )
+    if month_match:
+        month_str = month_match.group(1)
+        day_str = month_match.group(2)
+        year_str = month_match.group(3) or str(now_utc.year)
+        try:
+            dt = datetime.strptime(f"{month_str} {day_str} {year_str}", "%B %d %Y")
+            dt = dt.replace(tzinfo=timezone.utc)
+            return dt.strftime("%Y-%m-%d")
+        except ValueError:
+            return None
+
+    return None
+
+
+def _build_exact_due_date_response(user_message: str) -> Optional[str]:
+    """Return a direct DB answer for exact-date due queries, when applicable."""
+    message_lower = user_message.lower()
+    asks_due_date = any(token in message_lower for token in ("due", "task", "tasks", "test", "tests"))
+    if not asks_due_date:
+        return None
+
+    target_date = _extract_specific_date_iso(user_message)
+    if not target_date:
+        return None
+
+    conn = get_db()
+    cur = dict_cursor(conn)
+    try:
+        cur.execute(
+            "SELECT task_id, title, remediation_type, due_date "
+            "FROM vanta_tasks WHERE due_date LIKE %s "
+            "AND status NOT IN ('remediated', 'rejected') "
+            "ORDER BY due_date ASC LIMIT 50",
+            (f"{target_date}%",),
+        )
+        tasks = cur.fetchall()
+
+        if not tasks:
+            return (
+                f"There are no open tasks due on **{target_date}** "
+                f"in the current database snapshot."
+            )
+
+        lines = [f"Open tasks due on **{target_date}** ({len(tasks)} total):"]
+        for t in tasks[:20]:
+            lines.append(
+                f"• `{t['task_id']}` — {t['title'][:90]} "
+                f"({t['remediation_type']}, due {t['due_date'][:10]})"
+            )
+        if len(tasks) > 20:
+            lines.append(f"_...and {len(tasks) - 20} more._")
+        return "\n".join(lines)
+    finally:
+        cur.close()
+        conn.close()
 
 
 def get_context_for_llm(user_message: str) -> str:
     """Pull relevant context from the database for the LLM."""
+    from datetime import timedelta
     context_parts = []
     conn = get_db()
     cur = dict_cursor(conn)
 
-    # Current task summary
+    lookahead = _extract_lookahead_days(user_message)
+    now_utc = datetime.now(timezone.utc)
+    lookahead_cutoff = (now_utc + timedelta(days=lookahead)).isoformat()
+    now_iso = now_utc.isoformat()
+
+    context_parts.append(f"Current date/time: {now_utc.strftime('%Y-%m-%d %H:%M UTC')}")
+
+    # Overall counts
     cur.execute(
         "SELECT COUNT(*) as c FROM vanta_tasks WHERE status IN ('pending', 'notified')"
     )
@@ -76,22 +211,65 @@ def get_context_for_llm(user_message: str) -> str:
         "SELECT COUNT(*) as c FROM vanta_tasks WHERE status = 'remediated'"
     )
     remediated = cur.fetchone()["c"]
+
+    # Tasks due in the lookahead window
+    cur.execute(
+        "SELECT COUNT(*) as c FROM vanta_tasks WHERE due_date >= %s AND due_date <= %s "
+        "AND status NOT IN ('remediated', 'rejected')",
+        (now_iso, lookahead_cutoff),
+    )
+    due_soon = cur.fetchone()["c"]
+
+    # Overdue tasks (due before now, not resolved)
+    cur.execute(
+        "SELECT COUNT(*) as c FROM vanta_tasks WHERE due_date < %s "
+        "AND status NOT IN ('remediated', 'rejected')",
+        (now_iso,),
+    )
+    overdue = cur.fetchone()["c"]
+
     context_parts.append(
-        f"Current state: {pending} pending tasks, {remediated} remediated."
+        f"Task summary: {pending} pending, {remediated} remediated, "
+        f"{due_soon} due in next {lookahead} days, {overdue} overdue."
     )
 
-    # Recent tasks (up to 5)
+    # Tasks due in lookahead window (up to 20)
     cur.execute(
-        "SELECT task_id, title, status, remediation_type, account_id, region, due_date "
-        "FROM vanta_tasks ORDER BY due_date ASC LIMIT 5"
+        "SELECT task_id, title, status, remediation_type, severity, owner, account_id, region, due_date "
+        "FROM vanta_tasks WHERE due_date >= %s AND due_date <= %s "
+        "AND status NOT IN ('remediated', 'rejected') "
+        "ORDER BY due_date ASC LIMIT 20",
+        (now_iso, lookahead_cutoff),
     )
     tasks = cur.fetchall()
     if tasks:
-        lines = ["Recent tasks:"]
+        lines = [f"Tasks due in next {lookahead} days:"]
         for t in tasks:
+            owner_str = f", owner: {t['owner']}" if t.get('owner') else ""
+            severity_str = f", severity: {t['severity']}" if t.get('severity') else ""
             lines.append(
-                f"  - [{t['status']}] {t['title']} (type: {t['remediation_type']}, "
-                f"account: {t['account_id'] or '?'}, due: {t['due_date'] or '?'})"
+                f"  - [{t['status']}] {t['title']} (id: {t['task_id']}, type: {t['remediation_type']}{severity_str}, "
+                f"account: {t['account_id'] or '?'}, due: {t['due_date'][:10] if t['due_date'] else '?'}{owner_str})"
+            )
+        context_parts.append("\n".join(lines))
+
+    # Overdue tasks (up to 10)
+    cur.execute(
+        "SELECT task_id, title, status, remediation_type, severity, owner, account_id, region, due_date "
+        "FROM vanta_tasks WHERE due_date < %s "
+        "AND status NOT IN ('remediated', 'rejected') "
+        "ORDER BY due_date DESC LIMIT 10",
+        (now_iso,),
+    )
+    overdue_tasks = cur.fetchall()
+    if overdue_tasks:
+        lines = ["Overdue tasks:"]
+        for t in overdue_tasks:
+            owner_str = f", owner: {t['owner']}" if t.get('owner') else ""
+            severity_str = f", severity: {t['severity']}" if t.get('severity') else ""
+            lines.append(
+                f"  - [{t['status']}] {t['title']} (id: {t['task_id']}, type: {t['remediation_type']}{severity_str}, "
+                f"account: {t['account_id'] or '?'}, due: {t['due_date'][:10] if t['due_date'] else '?'}{owner_str})"
             )
         context_parts.append("\n".join(lines))
 
@@ -137,15 +315,185 @@ def save_lesson(task_id: str, remediation_type: str, problem: str,
     log.info(f"Saved lesson for task {task_id}: {problem[:80]}")
 
 
+def get_thread_history(channel_id: str, thread_ts: str, limit: int = 10) -> list:
+    """Fetch recent conversation history from a Slack thread."""
+    if not channel_id or not thread_ts:
+        return []
+
+    try:
+        result = app.client.conversations_replies(
+            channel=channel_id,
+            ts=thread_ts,
+            limit=limit + 1,  # include parent
+        )
+        messages = result.get("messages", [])
+
+        history = []
+        for msg in messages:
+            # Skip the very last message (it's the current one we're responding to)
+            if msg.get("ts") == thread_ts and len(messages) == 1:
+                break
+
+            text = msg.get("text", "").strip()
+            if not text:
+                continue
+
+            # Strip bot mentions
+            text = re.sub(r"<@[A-Z0-9]+>\s*", "", text).strip()
+
+            if msg.get("bot_id"):
+                history.append({"role": "assistant", "content": text})
+            else:
+                history.append({"role": "user", "content": text})
+
+        return history
+    except Exception as e:
+        log.warning(f"Could not fetch thread history: {e}")
+        return []
+
+
+def detect_specific_task(user_message: str, history: list = None) -> Optional[dict]:
+    """Detect if the user is asking about a specific task. Returns full task row or None."""
+    conn = get_db()
+    cur = dict_cursor(conn)
+
+    # 1. Check for task ID in message (hex strings 8+ chars)
+    id_match = re.search(r'\b([a-f0-9]{8,})\b', user_message.lower())
+    if id_match:
+        cur.execute("SELECT * FROM vanta_tasks WHERE task_id LIKE %s LIMIT 1",
+                     (f"%{id_match.group(1)}%",))
+        task = cur.fetchone()
+        if task:
+            cur.close(); conn.close()
+            return task
+
+    # 2. Search by keywords in title
+    words = [w for w in re.findall(r'[a-zA-Z]{3,}', user_message.lower())
+             if w not in {'the', 'what', 'about', 'show', 'tell', 'how', 'can', 'this',
+                          'that', 'with', 'from', 'for', 'and', 'are', 'task', 'test',
+                          'closest', 'date', 'due', 'fix', 'remediate', 'yes', 'help',
+                          'more', 'explain', 'details', 'please', 'could', 'would'}]
+    if words:
+        pattern = '%' + '%'.join(words[:3]) + '%'
+        cur.execute(
+            "SELECT * FROM vanta_tasks WHERE LOWER(title) LIKE LOWER(%s) "
+            "ORDER BY due_date ASC LIMIT 1", (pattern,))
+        task = cur.fetchone()
+        if task:
+            cur.close(); conn.close()
+            return task
+
+    # 3. Check thread history for previously mentioned task IDs
+    if history:
+        for msg in reversed(history):
+            if msg.get("role") != "assistant":
+                continue
+            tid = re.search(r'\b([a-f0-9]{8,})\b', msg.get("content", "").lower())
+            if tid:
+                cur.execute("SELECT * FROM vanta_tasks WHERE task_id LIKE %s LIMIT 1",
+                             (f"%{tid.group(1)}%",))
+                task = cur.fetchone()
+                if task:
+                    cur.close(); conn.close()
+                    return task
+            # Also try matching task title fragments from bot's previous reply
+            title_match = re.search(r'\*([^*]{10,})\*', msg.get("content", ""))
+            if title_match:
+                cur.execute(
+                    "SELECT * FROM vanta_tasks WHERE LOWER(title) LIKE LOWER(%s) LIMIT 1",
+                    (f"%{title_match.group(1)[:50]}%",))
+                task = cur.fetchone()
+                if task:
+                    cur.close(); conn.close()
+                    return task
+
+    cur.close(); conn.close()
+    return None
+
+
+def get_task_detail_context(task: dict, max_chars: int = 3000) -> str:
+    """Build detailed LLM context for a specific task."""
+    parts = [f"DETAILED TASK INFO (user is asking about this):"]
+    for field in ['task_id', 'title', 'description', 'framework', 'due_date', 'status',
+                  'remediation_type', 'severity', 'owner', 'account_id',
+                  'region', 'resource_id', 'resource_type',
+                  'remediated_at', 'remediated_by']:
+        val = task.get(field)
+        if val:
+            parts.append(f"  {field}: {val}")
+
+    if task.get('raw_json'):
+        try:
+            raw = json.loads(task['raw_json'])
+            known = {'task_id', 'title', 'description', 'due_date', 'framework',
+                     'remediation_type', 'resource_id', 'resource_type',
+                     'account_id', 'region', 'severity', 'owner'}
+            extra = {k: v for k, v in raw.items() if k not in known and v}
+            if extra:
+                extra_text = json.dumps(extra, indent=2, default=str)
+                if len(extra_text) > max_chars:
+                    extra_text = extra_text[:max_chars] + "\n...(truncated)"
+                parts.append(f"  Additional data:\n{extra_text}")
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    return "\n".join(parts)
+
+
+def get_live_resource_context(resource_type: str, resource_id: str) -> str:
+    """Fetch live resource details from Vanta API if configured."""
+    if not vanta or not vanta.is_configured():
+        return ""
+    try:
+        resources = vanta.get_resources(resource_type=resource_type)
+        match = next((r for r in resources
+                      if r.get("id") == resource_id
+                      or r.get("externalId") == resource_id), None)
+        if match:
+            text = json.dumps(match, indent=2, default=str)
+            if len(text) > 2000:
+                text = text[:2000] + "\n...(truncated)"
+            return f"Live Vanta resource data:\n{text}"
+    except Exception as e:
+        log.warning(f"Failed to fetch live Vanta resource: {e}")
+    return ""
+
+
 def ask_llm(user_message: str, channel_id: str = "", thread_ts: str = "") -> str:
-    """Send a message to the LLM with database context."""
+    """Send a message to the LLM with database context, task detail, and conversation history."""
     if not llm:
         return "LLM not configured. Set ANTHROPIC_API_KEY or GOOGLE_API_KEY."
 
+    # For exact date queries, answer directly from DB to avoid LLM ambiguity.
+    exact_due_date_response = _build_exact_due_date_response(user_message)
+    if exact_due_date_response:
+        return exact_due_date_response
+
+    # Build messages with conversation history for continuity
+    history = get_thread_history(channel_id, thread_ts)
+
     context = get_context_for_llm(user_message)
+
+    # Detect if user is asking about a specific task
+    specific_task = detect_specific_task(user_message, history)
+    if specific_task:
+        context += "\n\n--- SPECIFIC TASK DETAIL ---\n" + get_task_detail_context(specific_task)
+        # Try live Vanta data if we have a resource type
+        if specific_task.get('resource_type') and specific_task.get('resource_id'):
+            live = get_live_resource_context(specific_task['resource_type'], specific_task['resource_id'])
+            if live:
+                context += "\n\n--- LIVE VANTA DATA ---\n" + live
+
     system = SYSTEM_PROMPT + "\n\n--- DATABASE CONTEXT ---\n" + context
 
-    messages = [{"role": "user", "content": user_message}]
+    if history:
+        if history[-1].get("role") == "user" and history[-1].get("content") == user_message:
+            messages = history
+        else:
+            messages = history + [{"role": "user", "content": user_message}]
+    else:
+        messages = [{"role": "user", "content": user_message}]
+
     return llm.chat(messages, system=system)
 
 
@@ -474,14 +822,20 @@ def handle_vantaops_command(ack, body, client, respond):
             "📋 *VantaOps Commands:*\n"
             "• `/vantaops status` — Show current task summary\n"
             "• `/vantaops poll` — Trigger a manual Vanta poll\n"
+            "• `/vantaops due <days>` — Show tasks due in N days (e.g. `/vantaops due 10`)\n"
             "• `/vantaops audit` — Show recent remediation audit log\n"
             "• `/vantaops task <id>` — Show details for a specific task"
         )
         return
 
     if text == "status":
+        from datetime import timedelta
         conn = get_db()
         cur = dict_cursor(conn)
+        now_utc = datetime.now(timezone.utc)
+        now_iso = now_utc.isoformat()
+        seven_days = (now_utc + timedelta(days=7)).isoformat()
+
         cur.execute(
             "SELECT COUNT(*) as c FROM vanta_tasks WHERE status IN ('pending', 'notified')"
         )
@@ -494,12 +848,26 @@ def handle_vantaops_command(ack, body, client, respond):
             "SELECT COUNT(*) as c FROM vanta_tasks WHERE status = 'snoozed'"
         )
         snoozed = cur.fetchone()["c"]
+        cur.execute(
+            "SELECT COUNT(*) as c FROM vanta_tasks WHERE due_date >= %s AND due_date <= %s "
+            "AND status NOT IN ('remediated', 'rejected')",
+            (now_iso, seven_days),
+        )
+        due_soon = cur.fetchone()["c"]
+        cur.execute(
+            "SELECT COUNT(*) as c FROM vanta_tasks WHERE due_date < %s "
+            "AND status NOT IN ('remediated', 'rejected')",
+            (now_iso,),
+        )
+        overdue = cur.fetchone()["c"]
         cur.close()
         conn.close()
 
         respond(
-            f"📊 *VantaOps Status:*\n"
-            f"• Pending/Notified: {pending}\n"
+            f"📊 *VantaOps Status* ({now_utc.strftime('%Y-%m-%d %H:%M UTC')}):\n"
+            f"• Due in next 7 days: {due_soon}\n"
+            f"• Overdue: {overdue}\n"
+            f"• Total pending: {pending}\n"
             f"• Remediated: {remediated}\n"
             f"• Snoozed: {snoozed}"
         )
@@ -554,8 +922,55 @@ def handle_vantaops_command(ack, body, client, respond):
         else:
             respond(f"Task `{task_id}` not found.")
 
+    elif text.startswith("due"):
+        from datetime import timedelta
+        # Parse days from "due 10" or "due 12 days"
+        m = re.search(r'(\d+)', text)
+        days = int(m.group(1)) if m else 7
+
+        conn = get_db()
+        cur = dict_cursor(conn)
+        now_utc = datetime.now(timezone.utc)
+        now_iso = now_utc.isoformat()
+        cutoff = (now_utc + timedelta(days=days)).isoformat()
+
+        cur.execute(
+            "SELECT task_id, title, status, remediation_type, account_id, region, due_date "
+            "FROM vanta_tasks WHERE due_date >= %s AND due_date <= %s "
+            "AND status NOT IN ('remediated', 'rejected') "
+            "ORDER BY due_date ASC LIMIT 30",
+            (now_iso, cutoff),
+        )
+        tasks = cur.fetchall()
+
+        cur.execute(
+            "SELECT COUNT(*) as c FROM vanta_tasks WHERE due_date >= %s AND due_date <= %s "
+            "AND status NOT IN ('remediated', 'rejected')",
+            (now_iso, cutoff),
+        )
+        total = cur.fetchone()["c"]
+        cur.close()
+        conn.close()
+
+        if not tasks:
+            respond(f"✅ No tasks due in the next {days} days.")
+        else:
+            lines = [f"📋 *Tasks due in next {days} days* ({total} total):"]
+            for t in tasks:
+                due_str = t['due_date'][:10] if t['due_date'] else '?'
+                resource_hint = f", resource {t['resource_id'][:16]}" if t.get('resource_id') else ""
+                lines.append(
+                    f"• `{t['task_id']}` — {t['title'][:80]} "
+                    f"({t['remediation_type']}, due {due_str}{resource_hint})"
+                )
+            if total > 30:
+                lines.append(f"_...and {total - 30} more. Use `/vantaops task <id>` for details._")
+            respond("\n".join(lines))
+
     else:
-        respond(f"Unknown command: `{text}`. Try `/vantaops help`.")
+        # Route unknown commands through the LLM for natural language handling
+        response = ask_llm(f"/vantaops {text}")
+        respond(response)
 
 
 # ---------------------------------------------------------------------------
@@ -570,7 +985,6 @@ def handle_mention(event, client):
     # Strip the bot mention from the text
     text = event.get("text", "")
     # Remove <@BOTID> prefix
-    import re
     text = re.sub(r"<@[A-Z0-9]+>\s*", "", text).strip()
 
     if not text:
@@ -638,5 +1052,9 @@ if __name__ == "__main__":
     init_db()
     log.info("Database initialized.")
     llm = LLMRouter()
+    vanta = VantaClient(
+        os.environ.get("VANTA_CLIENT_ID", ""),
+        os.environ.get("VANTA_CLIENT_SECRET", ""),
+    )
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
     handler.start()

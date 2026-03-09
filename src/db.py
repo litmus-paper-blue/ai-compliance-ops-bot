@@ -43,12 +43,18 @@ def init_db():
             region          TEXT,
             remediation_type TEXT,
             status          TEXT DEFAULT 'pending',
+            severity        TEXT,
+            owner           TEXT,
             notified_at     TEXT,
             remediated_at   TEXT,
             remediated_by   TEXT,
             slack_ts        TEXT,
             raw_json        TEXT
         );
+
+        -- Add columns if upgrading from older schema
+        ALTER TABLE vanta_tasks ADD COLUMN IF NOT EXISTS owner TEXT;
+        ALTER TABLE vanta_tasks ADD COLUMN IF NOT EXISTS severity TEXT;
 
         CREATE TABLE IF NOT EXISTS audit_log (
             id              SERIAL PRIMARY KEY,

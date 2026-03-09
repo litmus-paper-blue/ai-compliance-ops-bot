@@ -1,0 +1,119 @@
+name: Deploy Slack Bot
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - src/**
+      - requirements.txt
+      - Dockerfile.slack
+      - docker-compose.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-push:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -f Dockerfile.slack -t vantaops-slack:${{ github.sha }} .
+
+      - name: Tag latest
+        run: docker tag vantaops-slack:${{ github.sha }} vantaops-slack:latest
+
+      # TODO: Push to your container registry
+      # Uncomment and configure one of these:
+
+      # --- Amazon ECR ---
+      # - uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     aws-access-key-id: ${{ secrets.BOT_AWS_ACCESS_KEY_ID }}
+      #     aws-secret-access-key: ${{ secrets.BOT_AWS_SECRET_ACCESS_KEY }}
+      #     aws-region: us-east-1
+      #
+      # - uses: aws-actions/amazon-ecr-login@v2
+      #   id: ecr
+      #
+      # - name: Push to ECR
+      #   run: |
+      #     docker tag vantaops-slack:latest ${{ steps.ecr.outputs.registry }}/vantaops-slack:latest
+      #     docker tag vantaops-slack:${{ github.sha }} ${{ steps.ecr.outputs.registry }}/vantaops-slack:${{ github.sha }}
+      #     docker push ${{ steps.ecr.outputs.registry }}/vantaops-slack:latest
+      #     docker push ${{ steps.ecr.outputs.registry }}/vantaops-slack:${{ github.sha }}
+
+      # --- GitHub Container Registry ---
+      # - uses: docker/login-action@v3
+      #   with:
+      #     registry: ghcr.io
+      #     username: ${{ github.actor }}
+      #     password: ${{ secrets.GITHUB_TOKEN }}
+      #
+      # - name: Push to GHCR
+      #   run: |
+      #     docker tag vantaops-slack:latest ghcr.io/${{ github.repository }}/vantaops-slack:latest
+      #     docker tag vantaops-slack:${{ github.sha }} ghcr.io/${{ github.repository }}/vantaops-slack:${{ github.sha }}
+      #     docker push ghcr.io/${{ github.repository }}/vantaops-slack:latest
+      #     docker push ghcr.io/${{ github.repository }}/vantaops-slack:${{ github.sha }}
+
+  # deploy:
+  #   name: Deploy to Environment
+  #   needs: build-and-push
+  #   runs-on: ubuntu-latest
+  #
+  #   steps:
+  #     # --- EC2 via SSH ---
+  #     # - name: Deploy to EC2
+  #     #   uses: appleboy/ssh-action@v1
+  #     #   with:
+  #     #     host: ${{ secrets.EC2_HOST }}
+  #     #     username: ${{ secrets.EC2_USER }}
+  #     #     key: ${{ secrets.EC2_SSH_KEY }}
+  #     #     script: |
+  #     #       cd /opt/vantaops
+  #     #       docker compose pull slack-bot
+  #     #       docker compose up -d slack-bot
+  #
+  #     # --- ECS ---
+  #     # - uses: aws-actions/configure-aws-credentials@v4
+  #     #   with:
+  #     #     aws-access-key-id: ${{ secrets.BOT_AWS_ACCESS_KEY_ID }}
+  #     #     aws-secret-access-key: ${{ secrets.BOT_AWS_SECRET_ACCESS_KEY }}
+  #     #     aws-region: us-east-1
+  #     #
+  #     # - name: Deploy to ECS
+  #     #   run: |
+  #     #     aws ecs update-service \
+  #     #       --cluster vantaops \
+  #     #       --service slack-bot \
+  #     #       --force-new-deployment
+  #
+  #     # --- Kubernetes ---
+  #     # - name: Deploy to K8s
+  #     #   run: |
+  #     #     kubectl set image deployment/vantaops-slack \
+  #     #       slack-bot=<registry>/vantaops-slack:${{ github.sha }} \
+  #     #       -n complianceops
+
+# Required GitHub Secrets:
+#
+# Bot runtime:
+#   SLACK_BOT_TOKEN          - xoxb-...
+#   SLACK_APP_TOKEN          - xapp-...
+#   SLACK_CHANNEL_ID         - C...
+#   DATABASE_URL             - postgresql://...
+#   ANTHROPIC_API_KEY        - sk-ant-... (or Azure/Google LLM keys)
+#   AZURE_OPENAI_API_KEY     - Azure OpenAI key
+#   AZURE_OPENAI_ENDPOINT    - https://...openai.azure.com
+#   AZURE_OPENAI_DEPLOYMENT  - gpt-4.1-mini
+#   VANTA_CLIENT_ID          - Vanta OAuth client ID
+#   VANTA_CLIENT_SECRET      - Vanta OAuth client secret
+#
+# Bot AWS (AssumeRole into target accounts for remediation):
+#   BOT_AWS_ACCESS_KEY_ID
+#   BOT_AWS_SECRET_ACCESS_KEY
