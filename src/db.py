@@ -87,6 +87,49 @@ def init_db():
             tags            TEXT,
             source          TEXT DEFAULT 'slack'
         );
+
+        CREATE TABLE IF NOT EXISTS person_security_tasks (
+            person_task_id  TEXT PRIMARY KEY,
+            owner_name      TEXT,
+            owner_email     TEXT,
+            task_title      TEXT NOT NULL,
+            task_category   TEXT,
+            status          TEXT,
+            due_date        TEXT,
+            completed_at    TEXT,
+            synced_at       TEXT NOT NULL,
+            raw_json        TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS owner_aliases (
+            alias_normalized TEXT PRIMARY KEY,
+            alias            TEXT NOT NULL,
+            canonical_name   TEXT NOT NULL,
+            confidence       REAL DEFAULT 0.5,
+            source           TEXT DEFAULT 'bot',
+            last_seen_at     TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS task_links (
+            parent_task_id   TEXT NOT NULL,
+            child_task_id    TEXT NOT NULL,
+            link_type        TEXT NOT NULL,
+            confidence       REAL DEFAULT 0.5,
+            source           TEXT DEFAULT 'poller',
+            created_at       TEXT NOT NULL,
+            PRIMARY KEY (parent_task_id, child_task_id, link_type)
+        );
+
+        CREATE TABLE IF NOT EXISTS response_feedback (
+            id              SERIAL PRIMARY KEY,
+            response_id     TEXT NOT NULL,
+            channel_id      TEXT,
+            thread_ts       TEXT,
+            user_id         TEXT,
+            feedback        TEXT NOT NULL,
+            message_excerpt TEXT,
+            created_at      TEXT NOT NULL
+        );
     """)
     conn.commit()
     cur.close()

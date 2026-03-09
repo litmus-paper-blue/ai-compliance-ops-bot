@@ -5,6 +5,7 @@ Used by both the poller and the Slack bot for Vanta API access.
 """
 
 import time
+import os
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -118,3 +119,96 @@ class VantaClient:
         if resource_type:
             params["filter[resourceType]"] = resource_type
         return self._get_paginated("/v1/resources", params=params)
+
+    def get_person_security_tasks(self) -> list:
+        """Fetch personnel/security tasks if account scopes expose them."""
+        configured_endpoint = os.environ.get("VANTAOPS_PERSON_SECURITY_ENDPOINT", "").strip()
+        candidates = [configured_endpoint] if configured_endpoint else [
+            "/v1/people",
+            "/v1/personnel",
+            "/v1/security-tasks",
+        ]
+
+        for endpoint in [c for c in candidates if c]:
+            try:
+                rows = self._get_paginated(endpoint, params={"pageSize": 100})
+            except requests.exceptions.HTTPError as e:
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                # Scoped tokens commonly cannot access personnel endpoints.
+                if status in (403, 404):
+                    log.info(f"Skipping unavailable personnel endpoint {endpoint} (status={status}).")
+                    continue
+                raise
+
+            normalized = self._normalize_person_security_rows(rows)
+            if normalized:
+                log.info(f"Fetched {len(normalized)} personnel/security task rows from {endpoint}.")
+                return normalized
+
+        log.info("No accessible personnel/security endpoint returned task rows.")
+        return []
+
+    def _normalize_person_security_rows(self, rows: list) -> list:
+        """Normalize varying personnel payload shapes into task rows."""
+        results = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+
+            # Shape A: endpoint directly returns task-like rows.
+            if any(k in row for k in ("taskName", "taskType", "completedAt", "assignedAt")):
+                owner_name = (
+                    row.get("ownerName")
+                    or row.get("personName")
+                    or row.get("userName")
+                    or row.get("owner")
+                    or ""
+                )
+                owner_email = row.get("ownerEmail") or row.get("personEmail") or row.get("email") or ""
+                task_title = row.get("taskName") or row.get("title") or row.get("name") or "Unnamed security task"
+                task_id = row.get("id") or row.get("taskId") or f"{owner_email}:{task_title}"
+                status = "completed" if row.get("completedAt") else (row.get("status") or "open")
+                results.append({
+                    "person_task_id": str(task_id),
+                    "owner_name": str(owner_name),
+                    "owner_email": str(owner_email),
+                    "task_title": str(task_title),
+                    "task_category": str(row.get("taskType") or row.get("category") or "security"),
+                    "status": str(status).lower(),
+                    "due_date": str(row.get("dueDate") or row.get("dueAt") or ""),
+                    "completed_at": str(row.get("completedAt") or ""),
+                    "raw_json": row,
+                })
+                continue
+
+            # Shape B: person row with nested security tasks.
+            person_name = row.get("name") or row.get("displayName") or ""
+            person_email = row.get("email") or row.get("workEmail") or ""
+            nested_tasks = (
+                row.get("securityTasks")
+                or row.get("tasks")
+                or row.get("overdueSecurityTasks")
+                or []
+            )
+            if not isinstance(nested_tasks, list):
+                continue
+
+            for task in nested_tasks:
+                if not isinstance(task, dict):
+                    continue
+                task_title = task.get("name") or task.get("title") or task.get("taskName") or "Unnamed security task"
+                task_id = task.get("id") or f"{person_email}:{task_title}"
+                status = "completed" if task.get("completedAt") else (task.get("status") or "open")
+                results.append({
+                    "person_task_id": str(task_id),
+                    "owner_name": str(person_name),
+                    "owner_email": str(person_email),
+                    "task_title": str(task_title),
+                    "task_category": str(task.get("type") or task.get("category") or "security"),
+                    "status": str(status).lower(),
+                    "due_date": str(task.get("dueDate") or ""),
+                    "completed_at": str(task.get("completedAt") or ""),
+                    "raw_json": task,
+                })
+
+        return results

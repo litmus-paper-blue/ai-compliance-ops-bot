@@ -190,6 +190,51 @@ def extract_aws_context(finding: dict) -> dict:
     }
 
 
+def infer_and_store_task_links(cur, tasks: list) -> int:
+    """Infer parent/child links (e.g., package-vuln parent -> CVE child) and persist."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    parents = [
+        t for t in tasks
+        if "vulnerabilities identified in packages are addressed" in (t.get("title") or "").lower()
+    ]
+    if not parents:
+        return 0
+
+    link_count = 0
+    for child in tasks:
+        child_title = (child.get("title") or "").lower()
+        child_desc = (child.get("description") or "").lower()
+        is_cve = "cve-" in child_title or "cve-" in child_desc
+        if not is_cve:
+            continue
+
+        for parent in parents:
+            same_account = (parent.get("account_id") or "") == (child.get("account_id") or "")
+            same_type = (parent.get("remediation_type") or "") == (child.get("remediation_type") or "")
+            same_due_day = (parent.get("due_date") or "")[:10] and (parent.get("due_date") or "")[:10] == (child.get("due_date") or "")[:10]
+            if not (same_account and same_type and same_due_day):
+                continue
+
+            cur.execute(
+                "INSERT INTO task_links (parent_task_id, child_task_id, link_type, confidence, source, created_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT(parent_task_id, child_task_id, link_type) DO UPDATE SET "
+                "confidence = EXCLUDED.confidence, source = EXCLUDED.source, created_at = EXCLUDED.created_at",
+                (
+                    parent.get("task_id"),
+                    child.get("task_id"),
+                    "parent_finding",
+                    0.90,
+                    "poller",
+                    now_iso,
+                ),
+            )
+            link_count += 1
+            break
+
+    return link_count
+
+
 def _extract_account_from_arn(arn: str) -> str:
     """Pull AWS account ID from an ARN."""
     parts = arn.split(":")
@@ -396,8 +441,12 @@ def poll_and_notify(conn, client: VantaClient) -> str:
     # 1. Fetch failing tests and approaching vulnerabilities
     failing_tests = client.get_failing_tests()
     vulnerabilities = client.get_vulnerabilities(sla_days=LOOKAHEAD_DAYS)
+    person_security_tasks = client.get_person_security_tasks()
 
-    log.info(f"Fetched {len(failing_tests)} failing tests, {len(vulnerabilities)} vulnerabilities from Vanta.")
+    log.info(
+        f"Fetched {len(failing_tests)} failing tests, {len(vulnerabilities)} vulnerabilities, "
+        f"{len(person_security_tasks)} personnel tasks from Vanta."
+    )
 
     # 2. Normalize into a common task format
     tasks = []
@@ -421,7 +470,7 @@ def poll_and_notify(conn, client: VantaClient) -> str:
                 except (ValueError, TypeError):
                     pass
         if not due_date:
-            continue
+            due_date = None
 
         framework = test.get("category", test.get("framework", {}).get("name", ""))
         aws_ctx = extract_aws_context(test)
@@ -464,6 +513,41 @@ def poll_and_notify(conn, client: VantaClient) -> str:
             **aws_ctx,
         })
 
+    linked = infer_and_store_task_links(cur, tasks)
+    if linked:
+        log.info(f"Inferred and stored {linked} task links.")
+
+    # 2b. Sync personnel/security tasks for smarter owner queries
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for ptask in person_security_tasks:
+        cur.execute("""
+            INSERT INTO person_security_tasks
+                (person_task_id, owner_name, owner_email, task_title, task_category,
+                 status, due_date, completed_at, synced_at, raw_json)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT(person_task_id) DO UPDATE SET
+                owner_name = EXCLUDED.owner_name,
+                owner_email = EXCLUDED.owner_email,
+                task_title = EXCLUDED.task_title,
+                task_category = EXCLUDED.task_category,
+                status = EXCLUDED.status,
+                due_date = COALESCE(EXCLUDED.due_date, person_security_tasks.due_date),
+                completed_at = COALESCE(EXCLUDED.completed_at, person_security_tasks.completed_at),
+                synced_at = EXCLUDED.synced_at,
+                raw_json = EXCLUDED.raw_json
+        """, (
+            ptask.get("person_task_id", ""),
+            ptask.get("owner_name", ""),
+            ptask.get("owner_email", ""),
+            ptask.get("task_title", ""),
+            ptask.get("task_category", ""),
+            ptask.get("status", "open"),
+            ptask.get("due_date", ""),
+            ptask.get("completed_at", ""),
+            now_iso,
+            json.dumps(ptask.get("raw_json", {})),
+        ))
+
     # 3. Deduplicate — skip tasks already notified in the last 24h
     new_tasks = []
     for task in tasks:
@@ -489,7 +573,7 @@ def poll_and_notify(conn, client: VantaClient) -> str:
     alerted_count = 0
 
     # Sort by due date (most urgent first)
-    new_tasks.sort(key=lambda t: t.get("due_date", "9999"))
+    new_tasks.sort(key=lambda t: t.get("due_date") or "9999")
 
     for task in new_tasks:
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -498,13 +582,15 @@ def poll_and_notify(conn, client: VantaClient) -> str:
         # (skip old/past-due tasks from 2024 etc. — they're stored in DB for historical queries)
         slack_ts = None
         now_dt = datetime.now(timezone.utc)
-        try:
-            task_due = datetime.fromisoformat(task["due_date"].replace("Z", "+00:00"))
-            if now_dt <= task_due <= alert_cutoff:
-                slack_ts = send_slack_notification(task)
-                alerted_count += 1
-        except (ValueError, TypeError):
-            pass
+        due_date = task.get("due_date")
+        if due_date:
+            try:
+                task_due = datetime.fromisoformat(due_date.replace("Z", "+00:00"))
+                if now_dt <= task_due <= alert_cutoff:
+                    slack_ts = send_slack_notification(task)
+                    alerted_count += 1
+            except (ValueError, TypeError, AttributeError):
+                pass
 
         # Upsert into database (always)
         cur.execute("""
@@ -516,7 +602,7 @@ def poll_and_notify(conn, client: VantaClient) -> str:
             ON CONFLICT(task_id) DO UPDATE SET
                 title = EXCLUDED.title,
                 description = EXCLUDED.description,
-                due_date = EXCLUDED.due_date,
+                due_date = COALESCE(EXCLUDED.due_date, vanta_tasks.due_date),
                 framework = EXCLUDED.framework,
                 resource_id = EXCLUDED.resource_id,
                 resource_type = EXCLUDED.resource_type,

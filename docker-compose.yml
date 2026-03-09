@@ -78,6 +78,24 @@ services:
       postgres:
         condition: service_healthy
 
+  # ── Vanta Poller (on-demand) ─────────────────────────────────────────────
+  vanta-poller:
+    build:
+      context: .
+      dockerfile: Dockerfile.slack
+    restart: "no"
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql://vantaops:vantaops@postgres:5432/vantaops
+      - PYTHONPATH=/app:/app/src
+    command: ["python", "-m", "src.scripts.vanta_poller"]
+    networks:
+      - complianceops
+    depends_on:
+      postgres:
+        condition: service_healthy
+
 volumes:
   pg-data:
     driver: local

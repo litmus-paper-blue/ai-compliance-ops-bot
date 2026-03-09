@@ -124,6 +124,8 @@ DATABASE_URL=postgresql://vantaops:vantaops@localhost:5432/vantaops
 # Optional (add when ready)
 VANTA_CLIENT_ID=
 VANTA_CLIENT_SECRET=
+# Optional override if your tenant exposes personnel tasks on a custom endpoint
+VANTAOPS_PERSON_SECURITY_ENDPOINT=
 AWS_ACCESS_KEY_ID=
 AWS_SECRET_ACCESS_KEY=
 ```
@@ -138,6 +140,20 @@ Or start services individually:
 ```bash
 docker compose up -d postgres    # Start database first
 docker compose up -d slack-bot   # Then the bot
+```
+
+### Run Vanta poll from Docker command
+
+You can trigger a one-off Vanta poll directly from Docker Compose:
+
+```bash
+docker compose run --rm vanta-poller
+```
+
+Dry run (fetch + classify only, no Slack notifications):
+
+```bash
+docker compose run --rm vanta-poller python -m src.scripts.vanta_poller --dry-run
 ```
 
 ### 4. Test

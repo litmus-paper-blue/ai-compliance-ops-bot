@@ -163,6 +163,101 @@ User asked "who is this assigned to?" — bot had no data.
 
 ---
 
+## Phase 9: Data Accuracy Debugging (Vanta vs Bot Mismatch)
+
+### Trigger
+User observed direct Vanta/MCP answers differed from bot output:
+- Missing due tasks on exact dates (e.g., March 19)
+- Duplicate-looking CVE list output
+- Wrong/unhelpful owner answers ("unassigned")
+- `COMMON` resource type with opaque IDs instead of actionable context
+
+### Root Causes Found
+1. **LLM-only answers for structured questions** (date/owner/resource) led to ambiguity.
+2. **Poller upsert did not refresh core fields** (`title`, `description`, `due_date`, resource fields), leaving stale records.
+3. **Failing tests without explicit due date were dropped**, so owner-bearing parent records could be lost.
+4. **Resource extraction prioritized internal IDs** over actionable target IDs.
+5. **Owner matching logic missed real-world phrasing/typos** ("belong too").
+
+### Fixes Implemented
+- Added deterministic DB-backed handlers in bot for:
+  - Exact-date due queries
+  - CVE assignment queries
+  - Owner list queries
+  - Task resource metadata queries
+  - Owner-task queries with fuzzy matching and typo tolerance
+- Improved parent-owner fallback for CVE subtasks:
+  - If CVE row owner is empty, resolve owner from related parent finding.
+- Updated poller upsert to refresh canonical task fields on conflict.
+- Stopped dropping failing tests when due date is missing:
+  - Keep row for context/ownership, skip alert if no due date.
+- Improved resource extraction:
+  - Prefer `targetId`/`packageIdentifier` over opaque internal IDs.
+  - Infer practical type (e.g., `AWS_ECR`) when Vanta returns `COMMON`.
+- Added guardrails for live Vanta resource lookup:
+  - Skip `COMMON`
+  - Auto-disable noisy lookup path after first `403`.
+
+---
+
+## Phase 10: Docker Poller & External Postgres Workflow
+
+### What Was Added
+- Added dedicated `vanta-poller` service to `docker-compose.yml` (one-off runner).
+- Added README commands:
+  - `docker compose run --rm vanta-poller`
+  - dry-run variant with `--dry-run`.
+
+### External Postgres Guidance
+When DB is outside compose:
+- Use `--no-deps` and pass external `DATABASE_URL`
+- Reminder: inside container, `localhost` != host DB; use `host.docker.internal` or shared network alias.
+
+---
+
+## Phase 11: "Smarter Bot" Foundations (Context + Learning)
+
+### Goal
+Move from "single-table remediation assistant" toward "context-aware compliance assistant" with memory and feedback.
+
+### New Data Model
+- `person_security_tasks` table:
+  - stores open/completed personnel/security tasks for richer owner context.
+- `owner_aliases` table:
+  - maps normalized aliases (`ogonna`) to canonical names (`Ogonna Nnamani`).
+- `task_links` table:
+  - parent/child links (e.g., package finding parent -> CVE child).
+- `response_feedback` table:
+  - stores per-response thumbs up/down feedback for iterative improvement.
+
+### New Sync Logic
+- `VantaClient.get_person_security_tasks()`:
+  - tries tenant-accessible personnel/security endpoints.
+  - handles shape differences and normalizes rows.
+  - gracefully skips 403/404 endpoints.
+- Poller now syncs `person_security_tasks` each run.
+- Poller infers/stores task links in `task_links`.
+
+### New Bot Learning/Context Logic
+- Owner query now resolves across:
+  - remediation tasks (`vanta_tasks`)
+  - personnel tasks (`person_security_tasks`)
+  - aliases (`owner_aliases`)
+  - parent links (`task_links`)
+- Added alias auto-learning:
+  - successful user phrasing is stored as alias->canonical mapping.
+- Added feedback capture:
+  - bot messages in mentions/DM now include `👍 Correct` / `👎 Incorrect`
+  - actions persist to `response_feedback`.
+
+### Current Behavior Improvement
+Owner question responses can now include:
+- open remediation tasks
+- personnel task summary (open/completed)
+- recent completed personnel tasks
+
+---
+
 ## Bottlenecks & Decisions Log
 
 | Decision | Options Considered | Chosen | Why |
@@ -176,6 +271,11 @@ User asked "who is this assigned to?" — bot had no data.
 | Delete permissions | Include vs exclude | Exclude entirely | Safety — bot should never destroy resources |
 | TF state credentials | Same as provider vs separate | Separate | State bucket may live in different account |
 | Overdue task display | Full list vs count only | Count only (unless requested) | Noise reduction |
+| Structured question handling | LLM-only vs deterministic DB routing | Deterministic first | Eliminate hallucinations on date/owner/resource |
+| Resource ID selection | Internal ID vs target/context ID | Target/context first | More actionable output for remediation |
+| Owner resolution | Direct owner only vs multi-source + alias + link | Multi-source | Real Vanta payloads often split ownership across parent/child rows |
+| Poller execution | Slack-only trigger vs Docker one-off service | Both | More operational control and easier debugging |
+| Learning feedback | Passive logging vs explicit user feedback | Explicit thumbs feedback | Build measurable correction loop |
 
 ---
 
@@ -188,6 +288,7 @@ User asked "who is this assigned to?" — bot had no data.
 | `src/vanta_client.py` | New file | Extracted shared Vanta API client |
 | `src/db.py` | Modified | Added owner/severity columns, ALTER TABLE migrations |
 | `src/scripts/vanta_audit.py` | New file | Diagnostic script to audit all Vanta tests by AWS service |
+| `docker-compose.yml` | Modified | Added one-off `vanta-poller` service runnable via compose command |
 | `terraform/modules/vantaops-iam/main.tf` | Complete rewrite | 15 policies based on real Vanta audit, delete deny, IAM deny |
 | `terraform/main.tf` | Modified | Provider config, SNS variables, backend reference |
 | `terraform/backend.tf` | New file | S3 backend configuration |
@@ -198,16 +299,29 @@ User asked "who is this assigned to?" — bot had no data.
 | `.github/workflows/deploy-bot.yml` | New file | Bot build/deploy pipeline |
 | `.gitignore` | Modified | Added terraform.tfvars, *.tfstate, .terraform/ |
 | `README.md` | Modified | Updated commands, Azure OpenAI, alert window config |
+| `docs/development-journal.md` | Modified | Added phase-by-phase narrative for debugging, smart context, and learning loop |
 
 ---
 
 ## Still TODO
 
-- [ ] Rebuild Docker image with all changes: `docker compose build slack-bot`
-- [ ] Run `/vantaops poll` to re-sync tasks with owner/severity fields
+- [ ] Rebuild/restart bot + poller images with latest changes:
+  - `docker compose build slack-bot vanta-poller`
+  - `docker compose up -d --force-recreate slack-bot`
+- [ ] Run fresh poll to populate new tables and links:
+  - `/vantaops poll` or `docker compose run --rm --no-deps vanta-poller`
+- [ ] Verify personnel sync status in logs:
+  - Look for `Fetched ... personnel tasks` OR expected `Skipping unavailable personnel endpoint ...`
+- [ ] Validate owner query end-to-end with known sample:
+  - `what tasks belong too ogonna?`
+  - `69733f3dcc9acb0697b75208 this belongs to ogonna`
+- [ ] Validate feedback loop:
+  - Click `👍/👎` on a bot response and confirm row in `response_feedback`
+- [ ] Validate alias learning:
+  - Query with shorthand and full name; confirm improved matching
 - [ ] Run `terraform init -reconfigure -backend-config=backend-test.hcl` from `terraform/` directory
 - [ ] Run `terraform plan` to verify IAM changes
 - [ ] Populate GitHub Actions secrets for CI/CD
 - [ ] Test conversation continuity in Slack threads
-- [ ] Test live Vanta resource fetching via bot
+- [ ] Test resource-context replies after new `targetId` extraction
 - [ ] Add automated tests (pytest)

@@ -9,8 +9,10 @@ import os
 import sys
 import re
 import json
+import hashlib
 import logging
 import subprocess
+from difflib import SequenceMatcher
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -232,7 +234,7 @@ def _build_assignment_response(user_message: str) -> Optional[str]:
             "AND COALESCE(account_id, '') = COALESCE(%s, '') "
             "AND due_date LIKE %s "
             "ORDER BY CASE "
-            "  WHEN LOWER(title) LIKE '%vulnerabilities identified in packages are addressed%' THEN 0 "
+            "  WHEN LOWER(title) LIKE '%%vulnerabilities identified in packages are addressed%%' THEN 0 "
             "  ELSE 1 "
             "END, due_date ASC LIMIT 1",
             (
@@ -272,21 +274,379 @@ def _build_owner_list_response(user_message: str) -> Optional[str]:
     cur = dict_cursor(conn)
     try:
         cur.execute(
-            "SELECT DISTINCT owner FROM vanta_tasks "
+            "SELECT owner AS person FROM vanta_tasks "
             "WHERE owner IS NOT NULL AND TRIM(owner) <> '' "
-            "ORDER BY owner ASC LIMIT 100"
+            "UNION "
+            "SELECT owner_name AS person FROM person_security_tasks "
+            "WHERE owner_name IS NOT NULL AND TRIM(owner_name) <> '' "
+            "ORDER BY person ASC LIMIT 150"
         )
         rows = cur.fetchall()
         if not rows:
             return "I don't have any task owners in the database yet. Run a fresh poll to sync assignment data."
 
-        owners = [r["owner"] for r in rows if r.get("owner")]
+        owners = [r["person"] for r in rows if r.get("person")]
         lines = [f"I can see {len(owners)} known task owner(s) from synced tasks:"]
         lines.extend([f"• {owner}" for owner in owners[:30]])
         if len(owners) > 30:
             lines.append(f"_...and {len(owners) - 30} more._")
         lines.append("")
         lines.append("_Note: this is task owner data from synced Vanta findings, not a full company directory._")
+        return "\n".join(lines)
+    finally:
+        cur.close()
+        conn.close()
+
+
+def _extract_owner_candidate(user_message: str) -> Optional[str]:
+    """Extract a likely owner name from natural language owner-task questions."""
+    text = user_message.strip()
+    text = re.sub(r"^/vantaops\s+", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return None
+
+    patterns = [
+        r"(?:belong(?:s)?\s+t+o|assigned to|owned by|for)\s+([A-Za-z][A-Za-z .'\-]{1,80})\??$",
+        r"^what about\s+([A-Za-z][A-Za-z .'\-]{1,80})\??$",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip(" ?")
+
+    return None
+
+
+def _normalize_owner_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+
+
+def _resolve_owner_via_alias(cur, candidate: str) -> Optional[str]:
+    normalized = _normalize_owner_name(candidate)
+    if not normalized:
+        return None
+    cur.execute(
+        "SELECT canonical_name FROM owner_aliases WHERE alias_normalized = %s LIMIT 1",
+        (normalized,),
+    )
+    row = cur.fetchone()
+    return row.get("canonical_name") if row else None
+
+
+def _upsert_owner_alias(cur, alias: str, canonical_name: str, source: str = "owner-query"):
+    alias_norm = _normalize_owner_name(alias)
+    if not alias_norm or not canonical_name:
+        return
+    now_iso = datetime.now(timezone.utc).isoformat()
+    cur.execute(
+        "INSERT INTO owner_aliases (alias_normalized, alias, canonical_name, confidence, source, last_seen_at) "
+        "VALUES (%s, %s, %s, %s, %s, %s) "
+        "ON CONFLICT(alias_normalized) DO UPDATE SET "
+        "canonical_name = EXCLUDED.canonical_name, "
+        "confidence = GREATEST(owner_aliases.confidence, EXCLUDED.confidence), "
+        "source = EXCLUDED.source, "
+        "last_seen_at = EXCLUDED.last_seen_at",
+        (alias_norm, alias, canonical_name, 0.85, source, now_iso),
+    )
+
+
+def _best_owner_match(candidate: str, owners: list[str]) -> Optional[str]:
+    """Find the closest owner name using exact, substring, then fuzzy matching."""
+    if not owners:
+        return None
+    normalized = candidate.strip().lower()
+    if not normalized:
+        return None
+
+    for owner in owners:
+        if owner.lower() == normalized:
+            return owner
+
+    contains_matches = [o for o in owners if normalized in o.lower()]
+    if contains_matches:
+        return sorted(contains_matches, key=lambda o: (len(o), o.lower()))[0]
+
+    reverse_contains = [o for o in owners if o.lower() in normalized]
+    if reverse_contains:
+        return sorted(reverse_contains, key=lambda o: (len(o), o.lower()))[0]
+
+    scored = sorted(
+        ((SequenceMatcher(None, normalized, owner.lower()).ratio(), owner) for owner in owners),
+        reverse=True,
+    )
+    if scored and scored[0][0] >= 0.72:
+        return scored[0][1]
+    return None
+
+
+def _find_related_parent_owner(cur, task: dict) -> tuple[Optional[str], Optional[str]]:
+    """Infer owner from a related parent finding when the task row has no owner."""
+    cur.execute(
+        "SELECT p.task_id, p.owner "
+        "FROM task_links l "
+        "JOIN vanta_tasks p ON p.task_id = l.parent_task_id "
+        "WHERE l.child_task_id = %s "
+        "AND l.link_type = 'parent_finding' "
+        "AND p.owner IS NOT NULL AND TRIM(p.owner) <> '' "
+        "AND p.status NOT IN ('remediated', 'rejected') "
+        "ORDER BY l.confidence DESC LIMIT 1",
+        (task.get("task_id", ""),),
+    )
+    linked_parent = cur.fetchone()
+    if linked_parent:
+        owner = (linked_parent.get("owner") or "").strip()
+        if owner:
+            return owner, linked_parent.get("task_id")
+
+    due_prefix = (task.get("due_date") or "")[:10]
+    if not due_prefix:
+        return None, None
+
+    cur.execute(
+        "SELECT task_id, owner "
+        "FROM vanta_tasks "
+        "WHERE owner IS NOT NULL AND TRIM(owner) <> '' "
+        "AND status NOT IN ('remediated', 'rejected') "
+        "AND COALESCE(account_id, '') = COALESCE(%s, '') "
+        "AND due_date LIKE %s "
+        "AND task_id <> %s "
+        "ORDER BY CASE "
+        "  WHEN LOWER(title) LIKE '%%vulnerabilities identified in packages are addressed%%' THEN 0 "
+        "  ELSE 1 "
+        "END, due_date ASC LIMIT 1",
+        (
+            task.get("account_id"),
+            f"{due_prefix}%",
+            task.get("task_id", ""),
+        ),
+    )
+    parent = cur.fetchone()
+    if not parent:
+        return None, None
+    owner = (parent.get("owner") or "").strip()
+    parent_task_id = parent.get("task_id")
+    if not owner:
+        return None, None
+    return owner, parent_task_id
+
+
+def _build_task_owner_verification_response(user_message: str) -> Optional[str]:
+    """Handle statements/questions like '<task_id> belongs to <owner>' deterministically."""
+    text = user_message.strip()
+    if not re.search(r"\b([a-f0-9]{16,})\b", text.lower()):
+        return None
+    if not (
+        re.search(r"\bbelong(?:s)?\s+t+o\b", text.lower())
+        or any(phrase in text.lower() for phrase in ("assigned to", "owned by"))
+    ):
+        return None
+
+    task_id_match = re.search(r"\b([a-f0-9]{16,})\b", text.lower())
+    claimed_owner = _extract_owner_candidate(text)
+    if not task_id_match or not claimed_owner:
+        return None
+    task_id_fragment = task_id_match.group(1)
+
+    conn = get_db()
+    cur = dict_cursor(conn)
+    try:
+        cur.execute(
+            "SELECT * FROM vanta_tasks WHERE task_id LIKE %s LIMIT 1",
+            (f"%{task_id_fragment}%",),
+        )
+        task = cur.fetchone()
+        if not task:
+            return f"I couldn't find task `{task_id_fragment}` in the database."
+
+        direct_owner = (task.get("owner") or "").strip()
+        related_owner, parent_task_id = (None, None)
+        if not direct_owner:
+            related_owner, parent_task_id = _find_related_parent_owner(cur, task)
+
+        effective_owner = direct_owner or related_owner
+        if not effective_owner:
+            return (
+                f"Task `{task['task_id']}` currently has no owner on the task row, and I couldn't infer a parent owner yet."
+            )
+
+        is_match = _best_owner_match(claimed_owner, [effective_owner]) is not None
+        if is_match and parent_task_id and not direct_owner:
+            return (
+                f"Yes — task `{task['task_id']}` appears linked to **{effective_owner}** via parent finding "
+                f"`{parent_task_id}`."
+            )
+        if is_match:
+            return f"Yes — task `{task['task_id']}` is owned by **{effective_owner}**."
+
+        return (
+            f"Task `{task['task_id']}` currently resolves to owner **{effective_owner}** "
+            f"(claimed: **{claimed_owner}**)."
+        )
+    finally:
+        cur.close()
+        conn.close()
+
+
+def _build_owner_tasks_response(user_message: str) -> Optional[str]:
+    """Return direct DB results for 'what tasks belong to <owner>' questions."""
+    message_lower = user_message.lower()
+    if re.search(r"\bcve-\d{4}-\d{4,}\b", message_lower):
+        return None
+
+    asks_owner_tasks = (
+        bool(re.search(r"\bbelong(?:s)?\s+t+o\b", message_lower))
+        or any(phrase in message_lower for phrase in ("assigned to", "owned by", "what about"))
+    )
+    if not asks_owner_tasks:
+        return None
+
+    owner_candidate = _extract_owner_candidate(user_message)
+    if not owner_candidate:
+        return None
+
+    conn = get_db()
+    cur = dict_cursor(conn)
+    try:
+        cur.execute(
+            "SELECT owner AS person FROM vanta_tasks "
+            "WHERE owner IS NOT NULL AND TRIM(owner) <> '' "
+            "UNION "
+            "SELECT owner_name AS person FROM person_security_tasks "
+            "WHERE owner_name IS NOT NULL AND TRIM(owner_name) <> '' "
+            "ORDER BY person ASC"
+        )
+        owner_rows = cur.fetchall()
+        known_owners = [r["person"] for r in owner_rows if r.get("person")]
+        matched_owner = _best_owner_match(owner_candidate, known_owners)
+        if not matched_owner:
+            matched_owner = _resolve_owner_via_alias(cur, owner_candidate)
+        if matched_owner:
+            _upsert_owner_alias(cur, owner_candidate, matched_owner)
+
+        owner_pattern = f"%{owner_candidate.strip().lower()}%"
+        matched_pattern = f"%{matched_owner.lower()}%" if matched_owner else None
+
+        # 1) Direct owner-column matches.
+        if matched_owner:
+            cur.execute(
+                "SELECT task_id, title, remediation_type, due_date, status, owner "
+                "FROM vanta_tasks "
+                "WHERE (LOWER(owner) LIKE %s OR LOWER(owner) LIKE %s) "
+                "AND status NOT IN ('remediated', 'rejected') "
+                "ORDER BY due_date ASC LIMIT 40",
+                (matched_pattern, owner_pattern),
+            )
+        else:
+            cur.execute(
+                "SELECT task_id, title, remediation_type, due_date, status, owner "
+                "FROM vanta_tasks "
+                "WHERE LOWER(owner) LIKE %s "
+                "AND status NOT IN ('remediated', 'rejected') "
+                "ORDER BY due_date ASC LIMIT 40",
+                (owner_pattern,),
+            )
+        direct_tasks = cur.fetchall()
+
+        # 2) Fallback: owner appears in raw payload, not normalized owner column.
+        cur.execute(
+            "SELECT task_id, title, remediation_type, due_date, status, owner "
+            "FROM vanta_tasks "
+            "WHERE LOWER(COALESCE(raw_json, '')) LIKE %s "
+            "AND status NOT IN ('remediated', 'rejected') "
+            "ORDER BY due_date ASC LIMIT 40",
+            (owner_pattern,),
+        )
+        raw_owner_tasks = cur.fetchall()
+
+        # 3) Include unowned CVE subtasks linked to owner-matching parent findings.
+        cur.execute(
+            "SELECT DISTINCT t.task_id, t.title, t.remediation_type, t.due_date, t.status, t.owner "
+            "FROM vanta_tasks t "
+            "JOIN vanta_tasks p ON COALESCE(t.account_id, '') = COALESCE(p.account_id, '') "
+            "  AND SUBSTRING(COALESCE(t.due_date, '') FROM 1 FOR 10) = SUBSTRING(COALESCE(p.due_date, '') FROM 1 FOR 10) "
+            "WHERE (LOWER(t.title) LIKE '%%cve-%%' OR LOWER(COALESCE(t.description, '')) LIKE '%%cve-%%') "
+            "  AND (t.owner IS NULL OR TRIM(t.owner) = '') "
+            "  AND p.status NOT IN ('remediated', 'rejected') "
+            "  AND (LOWER(COALESCE(p.owner, '')) LIKE %s OR LOWER(COALESCE(p.raw_json, '')) LIKE %s) "
+            "  AND p.title <> t.title "
+            "ORDER BY t.due_date ASC LIMIT 40",
+            (owner_pattern, owner_pattern),
+        )
+        linked_cve_tasks = cur.fetchall()
+
+        # Deduplicate rows while preserving order.
+        merged = []
+        seen = set()
+        for row in [*direct_tasks, *raw_owner_tasks, *linked_cve_tasks]:
+            tid = row.get("task_id")
+            if tid and tid not in seen:
+                seen.add(tid)
+                merged.append(row)
+
+        display_owner = matched_owner or owner_candidate
+        # Personnel/security task coverage (completed/open) like Vanta in-app AI answers.
+        if matched_owner:
+            cur.execute(
+                "SELECT person_task_id, task_title, task_category, status, due_date, completed_at "
+                "FROM person_security_tasks "
+                "WHERE LOWER(owner_name) LIKE %s "
+                "ORDER BY CASE WHEN status = 'completed' THEN 1 ELSE 0 END, due_date ASC, task_title ASC "
+                "LIMIT 80",
+                (matched_pattern,),
+            )
+        else:
+            cur.execute(
+                "SELECT person_task_id, task_title, task_category, status, due_date, completed_at "
+                "FROM person_security_tasks "
+                "WHERE LOWER(owner_name) LIKE %s "
+                "ORDER BY CASE WHEN status = 'completed' THEN 1 ELSE 0 END, due_date ASC, task_title ASC "
+                "LIMIT 80",
+                (owner_pattern,),
+            )
+        person_tasks = cur.fetchall()
+        open_person = [p for p in person_tasks if (p.get("status") or "").lower() != "completed"]
+        done_person = [p for p in person_tasks if (p.get("status") or "").lower() == "completed"]
+
+        if not merged and not person_tasks:
+            conn.commit()
+            return f"I couldn't find tasks assigned to **{display_owner}** in the current database snapshot."
+
+        lines = []
+        if merged:
+            lines.append(f"Open remediation tasks for **{display_owner}** ({len(merged)} found):")
+        else:
+            lines.append(f"Open remediation tasks for **{display_owner}**: none found.")
+
+        for t in merged[:30]:
+            due_str = t["due_date"][:10] if t.get("due_date") else "?"
+            owner_str = t.get("owner") or "unassigned (linked via parent finding)"
+            lines.append(
+                f"• `{t['task_id']}` — {t['title'][:85]} "
+                f"({t['remediation_type']}, due {due_str}, owner: {owner_str})"
+            )
+        if len(merged) > 30:
+            lines.append(f"_...and {len(merged) - 30} more._")
+
+        lines.append("")
+        lines.append(
+            f"Personnel/security tasks for **{display_owner}**: "
+            f"{len(open_person)} open, {len(done_person)} completed."
+        )
+        for p in open_person[:12]:
+            due_str = p["due_date"][:10] if p.get("due_date") else "?"
+            lines.append(f"• OPEN — {p['task_title'][:90]} ({p.get('task_category') or 'security'}, due {due_str})")
+        if not open_person and done_person:
+            lines.append("• No open personnel tasks.")
+
+        if done_person:
+            lines.append("")
+            lines.append("Recently completed personnel tasks:")
+            for p in done_person[:8]:
+                completed = p["completed_at"][:10] if p.get("completed_at") else "recently"
+                lines.append(f"• DONE — {p['task_title'][:90]} (completed {completed})")
+
+        conn.commit()
         return "\n".join(lines)
     finally:
         cur.close()
@@ -640,10 +1000,20 @@ def ask_llm(user_message: str, channel_id: str = "", thread_ts: str = "") -> str
     if assignment_response:
         return assignment_response
 
+    # For explicit ownership assertions/questions on a specific task id.
+    owner_verification_response = _build_task_owner_verification_response(user_message)
+    if owner_verification_response:
+        return owner_verification_response
+
     # For "list users/owners" questions, return distinct known owners from DB.
     owner_list_response = _build_owner_list_response(user_message)
     if owner_list_response:
         return owner_list_response
+
+    # For owner-task questions, return direct DB-backed task lists.
+    owner_tasks_response = _build_owner_tasks_response(user_message)
+    if owner_tasks_response:
+        return owner_tasks_response
 
     # For resource questions, answer directly from DB and avoid speculative mapping.
     resource_response = _build_task_resource_response(user_message, history)
@@ -697,9 +1067,94 @@ def run_script(script: str, args: list) -> dict:
     }
 
 
+def post_bot_response(client, channel: str, thread_ts: str, response_text: str):
+    """Post bot response with lightweight feedback buttons for learning."""
+    text = (response_text or "").strip() or "No response generated."
+    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
+    response_id = f"resp-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{digest}"
+    excerpt = text[:200]
+    value_up = json.dumps({"response_id": response_id, "feedback": "up", "excerpt": excerpt})
+    value_down = json.dumps({"response_id": response_id, "feedback": "down", "excerpt": excerpt})
+    if len(text) > 2800:
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+        return
+
+    client.chat_postMessage(
+        channel=channel,
+        thread_ts=thread_ts,
+        text=text,
+        blocks=[
+            {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "👍 Correct"},
+                        "action_id": "vantaops_feedback_up",
+                        "value": value_up,
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "👎 Incorrect"},
+                        "action_id": "vantaops_feedback_down",
+                        "value": value_down,
+                    },
+                ],
+            },
+        ],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Action Handlers
 # ---------------------------------------------------------------------------
+
+@app.action("vantaops_feedback_up")
+@app.action("vantaops_feedback_down")
+def handle_feedback(ack, body, client):
+    """Capture user feedback on bot responses."""
+    ack()
+    user_id = body.get("user", {}).get("id", "")
+    channel_id = body.get("channel", {}).get("id", "")
+    message_ts = body.get("message", {}).get("ts", "")
+
+    try:
+        value = json.loads(body["actions"][0]["value"])
+    except Exception:
+        return
+
+    feedback = value.get("feedback", "")
+    response_id = value.get("response_id", "")
+    excerpt = value.get("excerpt", "")
+    if feedback not in ("up", "down") or not response_id:
+        return
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO response_feedback (response_id, channel_id, thread_ts, user_id, feedback, message_excerpt, created_at) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+        (
+            response_id,
+            channel_id,
+            message_ts,
+            user_id,
+            feedback,
+            excerpt,
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    client.chat_postMessage(
+        channel=channel_id,
+        thread_ts=message_ts,
+        text="Thanks for the feedback — I'll use it to improve future answers.",
+    )
+
 
 @app.action("vantaops_remediate")
 def handle_remediate(ack, body, client):
@@ -1174,11 +1629,7 @@ def handle_mention(event, client):
         return
 
     response = ask_llm(text, channel_id=channel, thread_ts=thread_ts)
-    client.chat_postMessage(
-        channel=channel,
-        thread_ts=thread_ts,
-        text=response,
-    )
+    post_bot_response(client, channel=channel, thread_ts=thread_ts, response_text=response)
 
 
 @app.event("message")
@@ -1214,11 +1665,7 @@ def handle_dm(event, client, logger):
         return
 
     response = ask_llm(text, channel_id=channel, thread_ts=thread_ts)
-    client.chat_postMessage(
-        channel=channel,
-        thread_ts=thread_ts,
-        text=response,
-    )
+    post_bot_response(client, channel=channel, thread_ts=thread_ts, response_text=response)
 
 
 # ---------------------------------------------------------------------------
