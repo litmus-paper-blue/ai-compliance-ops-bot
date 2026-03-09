@@ -49,6 +49,7 @@ log = logging.getLogger("vantaops-slack")
 app = App(token=SLACK_BOT_TOKEN)
 llm = None    # initialized after db in main()
 vanta = None  # initialized after db in main()
+live_resource_lookup_enabled = True
 
 SYSTEM_PROMPT = """You are VantaOps, an AI-powered Vanta compliance remediation assistant.
 
@@ -186,6 +187,156 @@ def _build_exact_due_date_response(user_message: str) -> Optional[str]:
     finally:
         cur.close()
         conn.close()
+
+
+def _build_assignment_response(user_message: str) -> Optional[str]:
+    """Return a direct DB answer for assignment/owner questions."""
+    message_lower = user_message.lower()
+    if not any(token in message_lower for token in ("assigned", "owner", "who is", "assignee")):
+        return None
+
+    cve_match = re.search(r"\b(cve-\d{4}-\d{4,})\b", message_lower)
+    if not cve_match:
+        return None
+
+    cve_id = cve_match.group(1).upper()
+    conn = get_db()
+    cur = dict_cursor(conn)
+    try:
+        cur.execute(
+            "SELECT task_id, title, owner, due_date, account_id, remediation_type "
+            "FROM vanta_tasks WHERE LOWER(title) LIKE LOWER(%s) "
+            "AND status NOT IN ('remediated', 'rejected') "
+            "ORDER BY due_date ASC LIMIT 1",
+            (f"%{cve_id}%",),
+        )
+        task = cur.fetchone()
+        if not task:
+            return f"I couldn't find an open task matching **{cve_id}** in the database."
+
+        owner = (task.get("owner") or "").strip()
+        if owner:
+            return (
+                f"**{cve_id}** is currently assigned to **{owner}** "
+                f"(task `{task['task_id']}`, due {task['due_date'][:10] if task.get('due_date') else '?'})."
+            )
+
+        # CVE subtasks are often unassigned while the parent vulnerability test has an owner.
+        due_prefix = (task.get("due_date") or "")[:10]
+        cur.execute(
+            "SELECT task_id, title, owner "
+            "FROM vanta_tasks "
+            "WHERE owner IS NOT NULL AND TRIM(owner) <> '' "
+            "AND status NOT IN ('remediated', 'rejected') "
+            "AND remediation_type = %s "
+            "AND COALESCE(account_id, '') = COALESCE(%s, '') "
+            "AND due_date LIKE %s "
+            "ORDER BY CASE "
+            "  WHEN LOWER(title) LIKE '%vulnerabilities identified in packages are addressed%' THEN 0 "
+            "  ELSE 1 "
+            "END, due_date ASC LIMIT 1",
+            (
+                task.get("remediation_type") or "",
+                task.get("account_id"),
+                f"{due_prefix}%",
+            ),
+        )
+        parent = cur.fetchone()
+        if parent:
+            return (
+                f"**{cve_id}** subtask `{task['task_id']}` is unassigned, but the related parent finding "
+                f"appears owned by **{parent['owner']}** (`{parent['task_id']}`)."
+            )
+
+        return (
+            f"**{cve_id}** is currently unassigned "
+            f"(task `{task['task_id']}`, due {task['due_date'][:10] if task.get('due_date') else '?'})."
+        )
+    finally:
+        cur.close()
+        conn.close()
+
+
+def _build_owner_list_response(user_message: str) -> Optional[str]:
+    """Return a direct DB list of known owners for 'list users' style questions."""
+    message_lower = user_message.lower()
+    wants_user_list = (
+        ("list" in message_lower and ("users" in message_lower or "owners" in message_lower))
+        or ("who can" in message_lower and "assigned" in message_lower)
+        or ("do you have a list of users" in message_lower)
+    )
+    if not wants_user_list:
+        return None
+
+    conn = get_db()
+    cur = dict_cursor(conn)
+    try:
+        cur.execute(
+            "SELECT DISTINCT owner FROM vanta_tasks "
+            "WHERE owner IS NOT NULL AND TRIM(owner) <> '' "
+            "ORDER BY owner ASC LIMIT 100"
+        )
+        rows = cur.fetchall()
+        if not rows:
+            return "I don't have any task owners in the database yet. Run a fresh poll to sync assignment data."
+
+        owners = [r["owner"] for r in rows if r.get("owner")]
+        lines = [f"I can see {len(owners)} known task owner(s) from synced tasks:"]
+        lines.extend([f"• {owner}" for owner in owners[:30]])
+        if len(owners) > 30:
+            lines.append(f"_...and {len(owners) - 30} more._")
+        lines.append("")
+        lines.append("_Note: this is task owner data from synced Vanta findings, not a full company directory._")
+        return "\n".join(lines)
+    finally:
+        cur.close()
+        conn.close()
+
+
+def _build_task_resource_response(user_message: str, history: list) -> Optional[str]:
+    """Return exact resource metadata for task/resource questions without LLM inference."""
+    message_lower = user_message.lower()
+    asks_resource = (
+        "resource" in message_lower
+        or ("aws" in message_lower and ("involved" in message_lower or "where" in message_lower))
+    )
+    if not asks_resource:
+        return None
+
+    task = detect_specific_task(user_message, history)
+    if not task:
+        return None
+
+    resource_id = task.get("resource_id") or "N/A"
+    resource_type = task.get("resource_type") or "N/A"
+    account_id = task.get("account_id") or "N/A"
+    region = task.get("region") or "N/A"
+    inferred_resource_type = resource_type
+    if resource_type.upper() == "COMMON":
+        text = " ".join(
+            [
+                str(task.get("title", "")),
+                str(task.get("description", "")),
+                str(task.get("raw_json", "")),
+            ]
+        ).lower()
+        if any(token in text for token in ("ecr", "aws container", "inspector", "container vulnerab")):
+            inferred_resource_type = "AWS_ECR"
+
+    lines = [
+        f"The AWS metadata recorded for task `{task['task_id']}` is:",
+        f"• Resource ID: `{resource_id}`",
+        f"• Resource Type: `{inferred_resource_type}`",
+        f"• Account: `{account_id}`",
+        f"• Region: `{region}`",
+    ]
+
+    if resource_type.upper() == "COMMON":
+        lines.append(
+            "_Note: Vanta stored this row as `COMMON`; type above is inferred from finding content._"
+        )
+
+    return "\n".join(lines)
 
 
 def get_context_for_llm(user_message: str) -> str:
@@ -442,8 +593,15 @@ def get_task_detail_context(task: dict, max_chars: int = 3000) -> str:
 
 def get_live_resource_context(resource_type: str, resource_id: str) -> str:
     """Fetch live resource details from Vanta API if configured."""
-    if not vanta or not vanta.is_configured():
+    global live_resource_lookup_enabled
+
+    if not vanta or not vanta.is_configured() or not live_resource_lookup_enabled:
         return ""
+
+    # Generic bucket types are often not readable from /v1/resources for scoped tokens.
+    if not resource_type or resource_type.upper() == "COMMON":
+        return ""
+
     try:
         resources = vanta.get_resources(resource_type=resource_type)
         match = next((r for r in resources
@@ -455,6 +613,11 @@ def get_live_resource_context(resource_type: str, resource_id: str) -> str:
                 text = text[:2000] + "\n...(truncated)"
             return f"Live Vanta resource data:\n{text}"
     except Exception as e:
+        status_code = getattr(getattr(e, "response", None), "status_code", None)
+        if status_code == 403:
+            live_resource_lookup_enabled = False
+            log.info("Live Vanta resource lookup disabled after 403 forbidden response.")
+            return ""
         log.warning(f"Failed to fetch live Vanta resource: {e}")
     return ""
 
@@ -469,8 +632,23 @@ def ask_llm(user_message: str, channel_id: str = "", thread_ts: str = "") -> str
     if exact_due_date_response:
         return exact_due_date_response
 
-    # Build messages with conversation history for continuity
+    # Build history early so we can resolve follow-up questions deterministically.
     history = get_thread_history(channel_id, thread_ts)
+
+    # For assignment questions, answer directly from DB.
+    assignment_response = _build_assignment_response(user_message)
+    if assignment_response:
+        return assignment_response
+
+    # For "list users/owners" questions, return distinct known owners from DB.
+    owner_list_response = _build_owner_list_response(user_message)
+    if owner_list_response:
+        return owner_list_response
+
+    # For resource questions, answer directly from DB and avoid speculative mapping.
+    resource_response = _build_task_resource_response(user_message, history)
+    if resource_response:
+        return resource_response
 
     context = get_context_for_llm(user_message)
 

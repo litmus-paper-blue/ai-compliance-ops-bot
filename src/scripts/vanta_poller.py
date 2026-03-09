@@ -75,6 +75,88 @@ def classify_remediation_type(title: str, description: str = "") -> str:
     return "manual"
 
 
+def extract_owner(finding: dict) -> str:
+    """Extract a human-readable owner/assignee from a Vanta finding."""
+    candidate_paths = [
+        ("owner", "displayName"),
+        ("owner", "email"),
+        ("owner", "name"),
+        ("assignee", "displayName"),
+        ("assignee", "email"),
+        ("assignee", "name"),
+    ]
+    for parent, child in candidate_paths:
+        block = finding.get(parent, {})
+        if isinstance(block, dict):
+            value = block.get(child)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    # Some payloads expose assignment as top-level strings.
+    for key in ("ownerEmail", "ownerName", "assignedTo", "assigneeEmail"):
+        value = finding.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    remediation_info = finding.get("remediationStatusInfo", {})
+    if isinstance(remediation_info, dict):
+        for key in ("owner", "assignee", "assignedTo"):
+            value = remediation_info.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    return ""
+
+
+def _infer_resource_type(finding: dict, default_type: str) -> str:
+    """Infer a more useful resource type when Vanta provides a generic value."""
+    if default_type and default_type.upper() != "COMMON":
+        return default_type
+
+    text_parts = [
+        str(finding.get("name", "")),
+        str(finding.get("title", "")),
+        str(finding.get("description", "")),
+        str(finding.get("failureDescription", "")),
+        str(finding.get("packageIdentifier", "")),
+        str(finding.get("targetId", "")),
+    ]
+    integration = finding.get("integration", {}) or {}
+    text_parts.extend(
+        [
+            str(integration.get("name", "")),
+            str(integration.get("provider", "")),
+            str(integration.get("type", "")),
+        ]
+    )
+    text = " ".join(text_parts).lower()
+
+    # Most common case in this repo: AWS container/package vulnerabilities from ECR scans.
+    if any(token in text for token in ("ecr", "aws container", "inspector", "container vulnerab")):
+        return "AWS_ECR"
+    if "ec2" in text:
+        return "AWS_EC2"
+    if "s3" in text:
+        return "AWS_S3"
+
+    return default_type or "COMMON"
+
+
+def _select_resource_id(finding: dict, resource: dict) -> str:
+    """Pick the most actionable resource identifier from Vanta fields."""
+    target_id = finding.get("targetId", "")
+    package_identifier = finding.get("packageIdentifier", "")
+    external_id = resource.get("externalId", "")
+    internal_id = resource.get("id", "")
+
+    # Prefer explicit target identifiers from vulnerability results
+    # (e.g., awsbot1_ecr1 from AWS container findings).
+    for value in (target_id, package_identifier, external_id, internal_id):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 def extract_aws_context(finding: dict) -> dict:
     """Extract AWS account, region, and resource info from a Vanta finding."""
     # Vanta structures vary — this handles common patterns
@@ -82,16 +164,12 @@ def extract_aws_context(finding: dict) -> dict:
     integration = finding.get("integration", {}) or {}
 
     # Vulnerabilities use flat fields like targetId, integrationId
-    resource_id = (
-        resource.get("id", "")
-        or resource.get("externalId", "")
-        or finding.get("targetId", "")
-        or finding.get("packageIdentifier", "")
-    )
+    resource_id = _select_resource_id(finding, resource)
     resource_type = (
         resource.get("resourceType", "")
         or finding.get("vulnerabilityType", "")
     )
+    resource_type = _infer_resource_type(finding, resource_type)
     account_id = (
         integration.get("accountId", "")
         or resource.get("accountId", "")
@@ -349,9 +427,7 @@ def poll_and_notify(conn, client: VantaClient) -> str:
         aws_ctx = extract_aws_context(test)
         rtype = classify_remediation_type(title, description)
 
-        # Extract owner info
-        owner_info = test.get("owner", {}) or {}
-        owner = owner_info.get("displayName", owner_info.get("email", ""))
+        owner = extract_owner(test)
 
         tasks.append({
             "task_id": task_id,
@@ -384,7 +460,7 @@ def poll_and_notify(conn, client: VantaClient) -> str:
             "framework": vuln.get("framework", {}).get("name", ""),
             "remediation_type": rtype,
             "severity": vuln.get("severity", ""),
-            "owner": "",
+            "owner": extract_owner(vuln),
             **aws_ctx,
         })
 
